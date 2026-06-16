@@ -1,0 +1,35 @@
+{
+  "name": "amazon-push-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone, segregated service that reads the ListingApp/PIM source of truth, builds Amazon SP-API payloads, pushes them to Amazon, and records a full audit trail. Shares no code, database, or process with FlyApp.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=24.0.0 <25.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "stop": "node scripts/stop.js",
+    "restart": "node scripts/restart.js",
+    "dev": "nodemon server.js",
+    "init-db": "node scripts/init-db.js",
+    "replay-audit": "node scripts/replay-audit-log.js",
+    "smoke": "node scripts/smoke-spapi.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "node-cron": "^4.0.0",
+    "nodemailer": "^6.9.14",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

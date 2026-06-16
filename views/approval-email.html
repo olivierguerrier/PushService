@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Amazon write approval required</title>
+</head>
+<body style="font-family: 'Nunito', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif; color: #1F2328; background: #F5F6F8; margin: 0; padding: 24px; line-height: 1.5;">
+  <div style="max-width: 640px; margin: 0 auto; background: #FFFFFF; border: 1px solid #dfe2ea; border-radius: 20px; overflow: hidden; box-shadow: 0 6px 16px rgba(0,0,0,0.08);">
+    <div style="background: #2D6CDF; padding: 20px 24px; text-align: center;">
+      <span style="display: inline-block; font-family: 'Nunito', 'Segoe UI', sans-serif; font-size: 20px; font-weight: 700; letter-spacing: 0.04em; color: #FFFFFF;">BATTAT CO</span>
+    </div>
+
+    <div style="padding: 24px;">
+      <h2 style="margin: 0 0 8px 0; font-size: 24px; font-weight: 700; color: #1F2328; line-height: 1.2;">Amazon write approval required</h2>
+      <p style="margin: 0 0 20px 0; color: #9AA1AC; font-size: 13px;">
+        Submission <code style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;">{{submissionUuid}}</code> &middot; received {{createdAt}}
+      </p>
+
+      <table style="border-collapse: collapse; width: 100%; font-size: 14px; margin-bottom: 20px;">
+        <tr><td style="padding: 7px 0; width: 140px; color: #9AA1AC;">Caller</td><td style="padding: 7px 0;"><strong>{{caller}}</strong></td></tr>
+        <tr><td style="padding: 7px 0; color: #9AA1AC;">Scope</td><td style="padding: 7px 0;"><strong>{{scope}}</strong></td></tr>
+        <tr><td style="padding: 7px 0; color: #9AA1AC;">Operation</td><td style="padding: 7px 0;">{{operation}}</td></tr>
+        <tr><td style="padding: 7px 0; color: #9AA1AC;">ASIN / Marketplace</td><td style="padding: 7px 0;"><strong><code style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;">{{asin}}</code></strong> &middot; {{marketplaceCode}}</td></tr>
+        <tr><td style="padding: 7px 0; color: #9AA1AC;">Vendor / SKU</td><td style="padding: 7px 0;">{{vendorCode}} &middot; <code style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;">{{sku}}</code></td></tr>
+        <tr><td style="padding: 7px 0; color: #9AA1AC;">Product type</td><td style="padding: 7px 0;">{{productType}}</td></tr>
+      </table>
+
+      <h3 style="margin: 0 0 8px 0; font-size: 20px; font-weight: 600; color: #1F2328;">Changes</h3>
+      <div style="background: #F5F6F8; border: 1px solid #dfe2ea; border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; margin-bottom: 24px;">{{patchSummary}}</div>
+
+      <div style="text-align: center;">
+        <a href="{{approveUrl}}"
+           style="display: inline-block; background: #2D6CDF; color: #FFFFFF; text-decoration: none; padding: 12px 24px; border-radius: 999px; font-weight: 600; font-size: 14px; margin-right: 8px;">
+          Approve and send to Amazon
+        </a>
+        <a href="{{rejectUrl}}"
+           style="display: inline-block; background: #FFFFFF; color: #2D6CDF; border: 2px solid #2D6CDF; text-decoration: none; padding: 10px 22px; border-radius: 999px; font-weight: 600; font-size: 14px;">
+          Reject
+        </a>
+      </div>
+
+      <p style="margin-top: 24px; color: #9AA1AC; font-size: 11px;">
+        Links expire in {{ttlMinutes}} minutes. If you didn't expect this email, reject the request and ping the service owner.
+      </p>
+    </div>
+  </div>
+</body>
+</html>

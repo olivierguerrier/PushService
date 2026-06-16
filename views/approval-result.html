@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<script>
+  (function () {
+    if (localStorage.getItem('theme') === 'dark') {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  })();
+</script>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{{title}}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700&display=swap" />
+<style>
+  :root {
+    --color-primary: #2D6CDF;
+    --background: #F5F6F8;
+    --card-background: #FFFFFF;
+    --text-primary: #1F2328;
+    --text-secondary: #3A3F45;
+    --text-muted: #9AA1AC;
+    --border-color: #dfe2ea;
+    --soft-mint: #E6FFF7;
+    --soft-yellow: #FFF5CC;
+    --color-pos-text: #166534;
+    --color-warn-text: #b45309;
+    --color-neg-tint: rgba(185, 28, 28, 0.12);
+    --color-neg-text: #b91c1c;
+    --shadow-md: 0 6px 16px rgba(0,0,0,0.12);
+    --font-family: 'Nunito', 'Inter', system-ui, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --radius-card: 20px;
+    --radius-pill: 999px;
+  }
+  [data-theme="dark"] {
+    --background: #111827;
+    --card-background: #1f2937;
+    --text-primary: #e2e5f0;
+    --text-secondary: #cbd5e1;
+    --text-muted: #9ca3af;
+    --border-color: #374151;
+    --soft-mint: rgba(52, 211, 153, 0.15);
+    --soft-yellow: rgba(251, 191, 36, 0.15);
+    --color-pos-text: #4ade80;
+    --color-warn-text: #fcd34d;
+    --color-neg-tint: rgba(252, 165, 165, 0.18);
+    --color-neg-text: #fca5a5;
+    --shadow-md: 0 6px 20px rgba(0,0,0,0.5);
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--font-family);
+    background: var(--background);
+    color: var(--text-primary);
+    margin: 0;
+    padding: 48px 24px;
+    line-height: 1.5;
+  }
+  .card {
+    max-width: 560px;
+    margin: 0 auto;
+    background: var(--card-background);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-md);
+    overflow: hidden;
+  }
+  .card-banner {
+    background: var(--color-primary);
+    padding: 24px;
+    text-align: center;
+  }
+  .card-banner img { height: 28px; }
+  .card-body { padding: 32px; }
+  h1 { margin: 0 0 12px 0; font-size: 24px; font-weight: 600; line-height: 1.2; }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 10px;
+    border-radius: var(--radius-pill);
+    font-size: 11px;
+    font-weight: 600;
+    margin-bottom: 16px;
+  }
+  .status.ok { background: var(--soft-mint); color: var(--color-pos-text); }
+  .status.warn { background: var(--soft-yellow); color: var(--color-warn-text); }
+  .status.bad { background: var(--color-neg-tint); color: var(--color-neg-text); }
+  p { font-size: 14px; color: var(--text-secondary); }
+  dl { margin: 16px 0 0 0; font-size: 13px; }
+  dt { color: var(--text-muted); margin-top: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  dd { margin: 2px 0 0 0; color: var(--text-secondary); }
+  code { font-family: var(--font-mono); font-size: 12px; }
+  .footer { margin-top: 24px; color: var(--text-muted); font-size: 11px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="card-banner">
+      <img src="/images/logo-battat-blue.svg" alt="Battat Co" />
+    </div>
+    <div class="card-body">
+      <h1>{{title}}</h1>
+      <span class="status {{statusClass}}">{{statusLabel}}</span>
+      <p>{{message}}</p>
+      <dl>
+        <dt>Submission</dt><dd><code>{{submissionUuid}}</code></dd>
+        <dt>Caller</dt><dd>{{caller}}</dd>
+        <dt>Scope</dt><dd>{{scope}}</dd>
+        <dt>ASIN</dt><dd><code>{{asin}}</code></dd>
+        <dt>Vendor / SKU</dt><dd>{{vendorCode}} &middot; <code>{{sku}}</code></dd>
+        <dt>Marketplace</dt><dd>{{marketplaceCode}}</dd>
+        <dt>Decided by</dt><dd>{{approvedBy}}</dd>
+        <dt>Decided at</dt><dd>{{approvedAt}}</dd>
+      </dl>
+      <p class="footer">You can close this tab. The audit trail records this decision.</p>
+    </div>
+  </div>
+</body>
+</html>

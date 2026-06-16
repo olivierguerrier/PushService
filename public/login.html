@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<script>
+  (function () {
+    if (localStorage.getItem('theme') === 'dark') {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  })();
+</script>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Amazon Push Service — Sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="login-screen">
+    <form class="login-card" id="loginForm" autocomplete="on">
+      <div class="login-banner">
+        <img src="/images/logo-battat-blue.svg" alt="Battat Co" class="login-logo" />
+      </div>
+
+      <div class="login-body">
+        <div class="intro">
+          <h1>Amazon Push Service</h1>
+          <p>Sign in with your ListingApp account to access the operator console.</p>
+        </div>
+
+        <div class="alert hidden" id="error"></div>
+
+        <div class="form-row">
+          <label class="form-label" for="username">Username or email</label>
+          <input class="form-control" id="username" name="username" required autofocus autocomplete="username" />
+        </div>
+        <div class="form-row">
+          <label class="form-label" for="password">Password</label>
+          <input class="form-control" id="password" name="password" type="password" required autocomplete="current-password" />
+        </div>
+
+        <button type="submit" class="btn-primary login-submit" id="submitBtn">Sign in</button>
+      </div>
+    </form>
+
+    <p class="login-tagline">Authenticated against ListingApp &middot; <span class="tag" id="versionTag"></span></p>
+  </div>
+
+  <script>
+    (function () {
+      const $ = (s) => document.querySelector(s);
+      const form = $('#loginForm');
+      const errEl = $('#error');
+      const btn = $('#submitBtn');
+
+      // Already signed in? Skip the form.
+      if (localStorage.getItem('aps_jwt')) {
+        location.replace(safeNext());
+        return;
+      }
+
+      // Surface the version so the login page matches the console chrome.
+      fetch('/healthz').then((r) => r.json()).then((h) => {
+        if (h && h.version) $('#versionTag').textContent = 'v' + h.version;
+      }).catch(() => {});
+
+      function safeNext() {
+        const raw = new URLSearchParams(location.search).get('next') || '/';
+        // Only same-origin absolute paths — blocks open-redirect payloads.
+        return (typeof raw === 'string' && raw.startsWith('/') && !raw.startsWith('//') && !raw.startsWith('/\\'))
+          ? raw : '/';
+      }
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        errEl.classList.add('hidden');
+        errEl.textContent = '';
+        btn.disabled = true;
+        try {
+          const username = $('#username').value.trim();
+          const password = $('#password').value;
+          const res = await fetch('/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ username, password })
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const msg = body.error === 'invalid_credentials' ? 'Invalid username or password.'
+              : body.error === 'auth_unavailable' ? 'ListingApp authentication is unreachable — try again shortly.'
+              : body.error === 'too_many_login_attempts' ? 'Too many attempts — wait a few minutes.'
+              : (body.error || `Sign-in failed (${res.status}).`);
+            throw new Error(msg);
+          }
+          localStorage.setItem('aps_jwt', body.token || '');
+          location.replace(safeNext());
+        } catch (err) {
+          errEl.textContent = err.message || 'Sign-in failed.';
+          errEl.classList.remove('hidden');
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
