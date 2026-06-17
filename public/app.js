@@ -78,10 +78,156 @@
     }
   }
 
-  const QUEUE_COLS = 19; // keep in sync with #queueTable header cell count
+  const JOB_COLS = 11;   // keep in sync with #jobsTable header cell count
   const changesCache = new Map(); // submission uuid / 'grp:'+id -> rendered detail HTML
   const groupSubs = new Map();    // group id -> array of submission rows in the group
   const subsByUuid = new Map();   // submission uuid -> last loaded queue row (for meta lookup)
+  let queueDisplayItems = [];
+  const selectedQueueUuids = new Set();
+  let queueBulkBusy = false;
+  let queueBulkMessage = '';
+  const selectedJobIds = new Set();
+  let jobBulkBusy = false;
+  let jobBulkMessage = '';
+
+  // ── Queue table columns (sort / filter / reorder / resize) ───────────────
+  const QUEUE_COLUMN_DEFS = [
+    { key: 'select', label: '', nohide: true, sortable: false, filterable: false, fixed: true },
+    { key: 'caret', label: '', nohide: true, sortable: false, filterable: false, fixed: true },
+    { key: 'created_at', label: 'Created', sortable: true, filterable: true },
+    { key: 'uuid', label: 'UUID', sortable: true, filterable: true },
+    { key: 'caller', label: 'Caller', sortable: true, filterable: true },
+    { key: 'scope', label: 'Scope', sortable: true, filterable: true },
+    { key: 'operation', label: 'Op', sortable: true, filterable: true },
+    { key: 'asin', label: 'ASIN', sortable: true, filterable: true },
+    { key: 'customer', label: 'Customer', sortable: true, filterable: true },
+    { key: 'season', label: 'Season', sortable: true, filterable: true },
+    { key: 'lifecycle', label: 'Lifecycle', sortable: true, filterable: true, title: 'FlyApp lifecycle status (meta.status)' },
+    { key: 'vendor_code', label: 'Vendor', sortable: true, filterable: true },
+    { key: 'item_number', label: 'Item #', sortable: true, filterable: true },
+    { key: 'sku', label: 'SKU', sortable: true, filterable: true },
+    { key: 'marketplace_code', label: 'Mkt', sortable: true, filterable: true },
+    { key: 'status', label: 'Status', sortable: true, filterable: true },
+    { key: 'approved_by', label: 'Approved by', sortable: true, filterable: true },
+    { key: 'updated_at', label: 'Updated', sortable: true, filterable: true },
+    { key: 'error', label: 'Error', sortable: true, filterable: true },
+    { key: 'actions', label: 'Action', nohide: true, sortable: false, filterable: false, fixed: true }
+  ];
+  const QUEUE_COL_KEYS = QUEUE_COLUMN_DEFS.map((c) => c.key);
+  const QUEUE_STORAGE = {
+    hidden: 'aps_queue_hidden',
+    order: 'aps_queue_order',
+    sort: 'aps_queue_sort',
+    filters: 'aps_queue_col_filters',
+    legacyHidden: 'aps_queue_cols'
+  };
+  const queueColState = {
+    hidden: new Set(),
+    order: [],
+    sortField: 'created_at',
+    sortDir: 'desc',
+    filters: {}
+  };
+  const LEGACY_QUEUE_COL_KEYS = QUEUE_COL_KEYS.filter((k) => k !== 'select');
+
+  // ── Pagination ───────────────────────────────────────────────────────────
+  // The server returns up to QUEUE_FETCH_LIMIT rows in one shot; filtering and
+  // sorting run over that whole set client-side, and only the slice for the
+  // current page is rendered. This guarantees filters/sort affect every loaded
+  // record, not just the visible page.
+  const QUEUE_FETCH_LIMIT = 1000;
+  const QUEUE_PAGE_SIZES = [50, 100, 200, 500, 1000];
+  const QUEUE_PAGE_STORAGE = 'aps_queue_page_size';
+  const queuePageState = { page: 1, pageSize: 200, fetchCapped: false };
+  function loadQueuePageSize() {
+    try {
+      const saved = Number(localStorage.getItem(QUEUE_PAGE_STORAGE));
+      if (QUEUE_PAGE_SIZES.includes(saved)) queuePageState.pageSize = saved;
+    } catch (_) { /* default */ }
+  }
+  function saveQueuePageSize() {
+    try { localStorage.setItem(QUEUE_PAGE_STORAGE, String(queuePageState.pageSize)); } catch (_) {}
+  }
+
+  function migrateLegacyQueueCols() {
+    if (localStorage.getItem(QUEUE_STORAGE.hidden)) return;
+    try {
+      const raw = localStorage.getItem(QUEUE_STORAGE.legacyHidden);
+      if (!raw) return;
+      const indices = JSON.parse(raw);
+      const hidden = new Set();
+      for (const i of indices) {
+        if (LEGACY_QUEUE_COL_KEYS[i]) hidden.add(LEGACY_QUEUE_COL_KEYS[i]);
+      }
+      localStorage.setItem(QUEUE_STORAGE.hidden, JSON.stringify([...hidden]));
+    } catch (_) { /* ignore */ }
+  }
+  function loadQueueColState() {
+    migrateLegacyQueueCols();
+    try {
+      const hidden = JSON.parse(localStorage.getItem(QUEUE_STORAGE.hidden) || '[]');
+      queueColState.hidden = new Set(Array.isArray(hidden) ? hidden : []);
+    } catch (_) { queueColState.hidden = new Set(); }
+    try {
+      const order = (localStorage.getItem(QUEUE_STORAGE.order) || '').split(',').map((s) => s.trim()).filter(Boolean);
+      queueColState.order = order.filter((k) => QUEUE_COL_KEYS.includes(k));
+    } catch (_) { queueColState.order = []; }
+    try {
+      const sort = JSON.parse(localStorage.getItem(QUEUE_STORAGE.sort) || '{}');
+      if (sort.field && QUEUE_COL_KEYS.includes(sort.field)) {
+        queueColState.sortField = sort.field;
+        queueColState.sortDir = sort.dir === 'asc' ? 'asc' : 'desc';
+      }
+    } catch (_) { /* defaults */ }
+    try {
+      const filters = JSON.parse(localStorage.getItem(QUEUE_STORAGE.filters) || '{}');
+      queueColState.filters = {};
+      for (const [k, vals] of Object.entries(filters)) {
+        if (QUEUE_COL_KEYS.includes(k) && Array.isArray(vals) && vals.length) {
+          queueColState.filters[k] = new Set(vals.map(String));
+        }
+      }
+    } catch (_) { queueColState.filters = {}; }
+    for (const def of QUEUE_COLUMN_DEFS) {
+      if (def.nohide) queueColState.hidden.delete(def.key);
+    }
+  }
+  function saveQueueHidden() {
+    localStorage.setItem(QUEUE_STORAGE.hidden, JSON.stringify([...queueColState.hidden]));
+  }
+  function saveQueueOrder() {
+    localStorage.setItem(QUEUE_STORAGE.order, queueColState.order.join(','));
+  }
+  function saveQueueSort() {
+    localStorage.setItem(QUEUE_STORAGE.sort, JSON.stringify({ field: queueColState.sortField, dir: queueColState.sortDir }));
+  }
+  function saveQueueFilters() {
+    const out = {};
+    for (const [k, set] of Object.entries(queueColState.filters)) {
+      if (set && set.size) out[k] = [...set];
+    }
+    localStorage.setItem(QUEUE_STORAGE.filters, JSON.stringify(out));
+  }
+  function fullQueueColumnOrder() {
+    const base = queueColState.order.length
+      ? queueColState.order.slice()
+      : QUEUE_COL_KEYS.slice();
+    for (const k of QUEUE_COL_KEYS) {
+      if (!base.includes(k)) base.push(k);
+    }
+    const fixedStart = ['select', 'caret'];
+    const fixedEnd = ['actions'];
+    const middle = base.filter((k) => QUEUE_COL_KEYS.includes(k) && !fixedStart.includes(k) && !fixedEnd.includes(k));
+    return fixedStart.concat(middle, fixedEnd.filter((k) => QUEUE_COL_KEYS.includes(k)));
+  }
+  function visibleQueueColumns() {
+    return fullQueueColumnOrder()
+      .map((k) => QUEUE_COLUMN_DEFS.find((d) => d.key === k))
+      .filter((c) => c && (!queueColState.hidden.has(c.key) || c.nohide));
+  }
+  function visibleQueueColCount() {
+    return visibleQueueColumns().length;
+  }
 
   // Well-known keys promoted from a submission's free-form meta blob to their
   // own columns. Lookup is case-insensitive and tolerant of common synonyms.
@@ -128,6 +274,15 @@
       return `<div class="meta-item"><span class="meta-key">${esc(k)}</span><span class="meta-val">${esc(val)}</span></div>`;
     }).join('');
     return `<div class="meta-block"><div class="meta-head">FlyApp context</div><div class="meta-grid">${items}</div></div>`;
+  }
+
+  // Requester's note for the approver, shown in the expanded detail row when
+  // present. Preserves line breaks; escaped to stay XSS-safe.
+  function renderCommentBlock(comment) {
+    const text = (comment == null ? '' : String(comment)).trim();
+    if (!text) return '';
+    return `<div class="meta-block"><div class="meta-head">Note from requester</div>`
+      + `<div class="meta-comment" style="white-space:pre-wrap;word-break:break-word;">${esc(text)}</div></div>`;
   }
 
   // SVG glyphs reused by the per-row and group-level approve/reject buttons.
@@ -177,20 +332,589 @@
     return `<span class="err-detail" title="${esc(title)}">${esc(n + ' error' + (n === 1 ? '' : 's'))}</span>`;
   }
 
-  // A normal single-submission row (one job -> one target).
-  function renderQueueRow(r) {
-    const uuid = r.submission_uuid || '';
-    const actions = r.status === 'PENDING_APPROVAL' ? rowActions(uuid) : '';
-    return `<tr data-uuid="${esc(uuid)}">
-      <td class="col-caret"><button class="caret" type="button" data-uuid="${esc(uuid)}" aria-label="Show changes">&#9654;</button></td>
-      <td>${esc(r.created_at)}</td><td><code>${esc(uuid.slice(0, 8))}</code></td>
-      <td>${esc(r.caller)}</td><td>${esc(r.scope)}</td><td>${esc(r.operation)}</td>
-      <td><code>${esc(r.asin || '')}</code></td>
-      <td>${metaCell(r.meta, 'customer')}</td><td>${metaCell(r.meta, 'season')}</td><td>${metaCell(r.meta, 'lifecycle')}</td>
-      <td>${esc(r.vendor_code || '')}</td><td><code>${esc(r.item_number || '')}</code></td>
-      <td><code>${esc(r.sku || '')}</code></td><td>${esc(r.marketplace_code || '')}</td>
-      <td>${statusBadge(r.status)}</td><td>${esc(r.approved_by || '')}</td><td>${esc(r.updated_at || '')}</td>
-      <td class="err">${errorCellHtml(r)}</td><td class="actions">${actions}</td></tr>`;
+  function queueFilterValue(item, key) {
+    if (item.type === 'solo') {
+      const r = item.data;
+      switch (key) {
+        case 'customer': return String(pickMeta(r.meta, 'customer') || '');
+        case 'season': return String(pickMeta(r.meta, 'season') || '');
+        case 'lifecycle': return String(pickMeta(r.meta, 'lifecycle') || '');
+        case 'uuid': return String(r.submission_uuid || '').slice(0, 8);
+        case 'error': return r.error_message || (r.errorDetails && r.errorDetails.length ? 'has error' : '');
+        case 'status': return String(r.status || '');
+        default: return r[key] == null ? '' : String(r[key]);
+      }
+    }
+    const { items } = item;
+    switch (key) {
+      case 'uuid': return 'GROUP';
+      case 'customer': {
+        const vals = [...new Set(items.map((i) => pickMeta(i.meta, 'customer')).filter(Boolean).map(String))];
+        return vals.length === 1 ? vals[0] : `(${vals.length})`;
+      }
+      case 'season': {
+        const vals = [...new Set(items.map((i) => pickMeta(i.meta, 'season')).filter(Boolean).map(String))];
+        return vals.length === 1 ? vals[0] : `(${vals.length})`;
+      }
+      case 'lifecycle': {
+        const vals = [...new Set(items.map((i) => pickMeta(i.meta, 'lifecycle')).filter(Boolean).map(String))];
+        return vals.length === 1 ? vals[0] : `(${vals.length})`;
+      }
+      case 'vendor_code': {
+        const n = new Set(items.map((i) => i.vendor_code).filter(Boolean)).size || items.length;
+        return `${n} vendor code${n === 1 ? '' : 's'}`;
+      }
+      case 'status': {
+        const counts = {};
+        items.forEach((i) => { counts[i.status] = (counts[i.status] || 0) + 1; });
+        return Object.entries(counts).map(([s, n]) => `${s}×${n}`).join(', ');
+      }
+      case 'error': {
+        const failed = items.filter((i) => i.error_message || (i.errorDetails && i.errorDetails.length));
+        return failed.length ? `${failed.length} error${failed.length === 1 ? '' : 's'}` : '';
+      }
+      case 'approved_by':
+        return [...new Set(items.map((i) => i.approved_by).filter(Boolean))].join(', ');
+      case 'updated_at':
+        return items.map((i) => i.updated_at).filter(Boolean).sort().slice(-1)[0] || '';
+      default: {
+        const vals = [...new Set(items.map((i) => (i[key] == null ? '' : String(i[key]))).filter((v) => v !== ''))];
+        if (vals.length === 0) return '';
+        if (vals.length === 1) return vals[0];
+        return `(${vals.length})`;
+      }
+    }
+  }
+
+  function queueSortValue(item, key) {
+    const raw = queueFilterValue(item, key);
+    if (key === 'created_at' || key === 'updated_at') return raw;
+    if (key === 'status' && item.type === 'solo') return item.data.status || '';
+    return raw.toLowerCase();
+  }
+
+  function applyQueueFiltersAndSort(items) {
+    let rows = items.slice();
+    for (const [key, allowed] of Object.entries(queueColState.filters)) {
+      if (!allowed || !allowed.size) continue;
+      rows = rows.filter((item) => allowed.has(queueFilterValue(item, key)));
+    }
+    const field = queueColState.sortField;
+    const dir = queueColState.sortDir === 'asc' ? 1 : -1;
+    if (field && QUEUE_COL_KEYS.includes(field)) {
+      rows.sort((a, b) => {
+        const av = queueSortValue(a, field);
+        const bv = queueSortValue(b, field);
+        if (av < bv) return -1 * dir;
+        if (av > bv) return 1 * dir;
+        return 0;
+      });
+    }
+    return rows;
+  }
+
+  function pendingQueueUuidsForItem(item) {
+    if (item.type === 'solo') {
+      const r = item.data;
+      return r.status === 'PENDING_APPROVAL' && r.submission_uuid ? [r.submission_uuid] : [];
+    }
+    return item.items
+      .filter((s) => s.status === 'PENDING_APPROVAL' && s.submission_uuid)
+      .map((s) => s.submission_uuid);
+  }
+
+  function allPendingQueueUuids() {
+    const out = [];
+    const seen = new Set();
+    for (const item of queueDisplayItems) {
+      for (const uuid of pendingQueueUuidsForItem(item)) {
+        if (seen.has(uuid)) continue;
+        seen.add(uuid);
+        out.push(uuid);
+      }
+    }
+    return out;
+  }
+
+  function visiblePendingQueueUuids() {
+    const out = [];
+    const seen = new Set();
+    for (const item of applyQueueFiltersAndSort(queueDisplayItems)) {
+      for (const uuid of pendingQueueUuidsForItem(item)) {
+        if (seen.has(uuid)) continue;
+        seen.add(uuid);
+        out.push(uuid);
+      }
+    }
+    return out;
+  }
+
+  function pruneQueueSelection() {
+    const valid = new Set(allPendingQueueUuids());
+    for (const uuid of [...selectedQueueUuids]) {
+      if (!valid.has(uuid)) selectedQueueUuids.delete(uuid);
+    }
+  }
+
+  function renderQueueCell(item, col) {
+    const key = col.key;
+    if (item.type === 'solo') {
+      const r = item.data;
+      const uuid = r.submission_uuid || '';
+      switch (key) {
+        case 'select': {
+          const uuids = pendingQueueUuidsForItem(item);
+          const checked = uuids.length && uuids.every((u) => selectedQueueUuids.has(u)) ? 'checked' : '';
+          const disabled = uuids.length ? '' : 'disabled';
+          return `<td class="select-cell"><input class="queue-select" type="checkbox" data-uuids="${esc(uuids.join(','))}" ${checked} ${disabled} aria-label="Select submission ${esc(uuid.slice(0, 8))}" /></td>`;
+        }
+        case 'caret':
+          return `<td class="col-caret"><button class="caret" type="button" data-uuid="${esc(uuid)}" aria-label="Show changes">&#9654;</button></td>`;
+        case 'created_at': return `<td>${esc(r.created_at)}</td>`;
+        case 'uuid': return `<td><code>${esc(uuid.slice(0, 8))}</code></td>`;
+        case 'caller': return `<td>${esc(r.caller)}</td>`;
+        case 'scope': return `<td>${esc(r.scope)}</td>`;
+        case 'operation': return `<td>${esc(r.operation)}</td>`;
+        case 'asin': return `<td><code>${esc(r.asin || '')}</code></td>`;
+        case 'customer': return `<td>${metaCell(r.meta, 'customer')}</td>`;
+        case 'season': return `<td>${metaCell(r.meta, 'season')}</td>`;
+        case 'lifecycle': return `<td>${metaCell(r.meta, 'lifecycle')}</td>`;
+        case 'vendor_code': return `<td>${esc(r.vendor_code || '')}</td>`;
+        case 'item_number': return `<td><code>${esc(r.item_number || '')}</code></td>`;
+        case 'sku': return `<td><code>${esc(r.sku || '')}</code></td>`;
+        case 'marketplace_code': return `<td>${esc(r.marketplace_code || '')}</td>`;
+        case 'status': return `<td>${statusBadge(r.status)}</td>`;
+        case 'approved_by': return `<td>${esc(r.approved_by || '')}</td>`;
+        case 'updated_at': return `<td>${esc(r.updated_at || '')}</td>`;
+        case 'error': return `<td class="err">${errorCellHtml(r)}</td>`;
+        case 'actions': {
+          const actions = r.status === 'PENDING_APPROVAL' ? rowActions(uuid) : '';
+          return `<td class="actions">${actions}</td>`;
+        }
+        default: return '<td></td>';
+      }
+    }
+    const { id, items } = item;
+    const vendorCount = new Set(items.map((i) => i.vendor_code).filter(Boolean)).size;
+    const pending = items.filter((i) => i.status === 'PENDING_APPROVAL').length;
+    const updated = items.map((i) => i.updated_at).filter(Boolean).sort().slice(-1)[0] || '';
+    const approvers = [...new Set(items.map((i) => i.approved_by).filter(Boolean))].join(', ');
+    const groupActions = pending
+      ? `<div style="display:inline-flex;gap:4px;align-items:center;">
+          <button class="btn-ghost btn-ghost--success gact approve" data-group="${esc(id)}" data-count="${pending}" title="Approve all pending">${CHECK_SVG} Approve all</button>
+          <button class="btn-ghost btn-ghost--danger gact reject" data-group="${esc(id)}" data-count="${pending}" title="Reject all pending">${X_SVG} Reject all</button>
+        </div>`
+      : '';
+    const vendorLabel = `${vendorCount || items.length} vendor code${(vendorCount || items.length) === 1 ? '' : 's'}`;
+    switch (key) {
+      case 'select': {
+        const uuids = pendingQueueUuidsForItem(item);
+        const checked = uuids.length && uuids.every((u) => selectedQueueUuids.has(u)) ? 'checked' : '';
+        const disabled = uuids.length ? '' : 'disabled';
+        return `<td class="select-cell"><input class="queue-select" type="checkbox" data-uuids="${esc(uuids.join(','))}" ${checked} ${disabled} aria-label="Select ${esc(String(uuids.length))} pending submission(s) in group" /></td>`;
+      }
+      case 'caret':
+        return `<td class="col-caret"><button class="caret" type="button" data-group="${esc(id)}" aria-label="Show grouped changes">&#9654;</button></td>`;
+      case 'created_at': return `<td>${esc(items[0].created_at)}</td>`;
+      case 'uuid': return `<td><span class="group-tag">GROUP</span> <span class="group-pill">${items.length}</span></td>`;
+      case 'caller': return `<td>${sharedCell(items, 'caller')}</td>`;
+      case 'scope': return `<td>${sharedCell(items, 'scope')}</td>`;
+      case 'operation': return `<td>${sharedCell(items, 'operation')}</td>`;
+      case 'asin': return `<td><code>${sharedCell(items, 'asin')}</code></td>`;
+      case 'customer': return `<td>${sharedMetaCell(items, 'customer')}</td>`;
+      case 'season': return `<td>${sharedMetaCell(items, 'season')}</td>`;
+      case 'lifecycle': return `<td>${sharedMetaCell(items, 'lifecycle')}</td>`;
+      case 'vendor_code': return `<td><span class="group-vendors">${esc(vendorLabel)}</span></td>`;
+      case 'item_number': return `<td><code>${sharedCell(items, 'item_number')}</code></td>`;
+      case 'sku': return `<td><code>${sharedCell(items, 'sku')}</code></td>`;
+      case 'marketplace_code': return `<td>${sharedCell(items, 'marketplace_code')}</td>`;
+      case 'status': return `<td class="group-status">${statusSummary(items)}</td>`;
+      case 'approved_by': return `<td>${esc(approvers)}</td>`;
+      case 'updated_at': return `<td>${esc(updated)}</td>`;
+      case 'error': return `<td class="err">${groupErrorCellHtml(items)}</td>`;
+      case 'actions': return `<td class="actions">${groupActions}</td>`;
+      default: return '<td></td>';
+    }
+  }
+
+  function buildQueueTableHeader(cols) {
+    return cols.map((col) => {
+      if (col.key === 'select') {
+        return '<th class="select-cell no-resize" data-col="select"><input id="selectAllQueueRows" type="checkbox" aria-label="Select all visible pending submissions" /></th>';
+      }
+      const sortActive = queueColState.sortField === col.key;
+      const filterSet = queueColState.filters[col.key];
+      const filterActive = !!(filterSet && filterSet.size);
+      const extraCls = [
+        col.key === 'select' ? 'select-cell' : '',
+        col.key === 'caret' ? 'col-caret' : '',
+        col.sortable ? 'sortable-header' : '',
+        sortActive ? 'sort-active' : '',
+        col.fixed ? 'no-resize' : ''
+      ].filter(Boolean).join(' ');
+      const title = col.title ? ` title="${esc(col.title)}"` : '';
+      const drag = col.fixed ? '' : ' draggable="true"';
+      const inner = (col.sortable || col.filterable)
+        ? colFilter.headerCell({
+          label: col.label,
+          sortable: col.sortable,
+          filterable: col.filterable,
+          sortActive,
+          sortDir: queueColState.sortDir,
+          filterActive,
+          filterCount: filterActive ? filterSet.size : 0
+        })
+        : esc(col.label);
+      return `<th class="${extraCls}" data-col="${esc(col.key)}"${title}${drag}>${inner}</th>`;
+    }).join('');
+  }
+
+  function renderQueueColumnFiltersBar() {
+    const bar = $('#queueColumnFiltersBar');
+    const text = $('#queueColumnFiltersBarText');
+    if (!bar || !text) return;
+    const active = Object.entries(queueColState.filters).filter(([, set]) => set && set.size);
+    if (!active.length) {
+      bar.classList.add('hidden');
+      return;
+    }
+    const labels = active.map(([key]) => {
+      const def = QUEUE_COLUMN_DEFS.find((c) => c.key === key);
+      return def ? def.label : key;
+    });
+    text.textContent = `Column filters active: ${labels.join(', ')} (${active.length})`;
+    bar.classList.remove('hidden');
+  }
+
+  function renderQueuePagination({ total, start, shown, pageCount }) {
+    const bar = $('#queuePagination');
+    if (!bar) return;
+    if (!total) { bar.classList.add('hidden'); return; }
+    bar.classList.remove('hidden');
+    const sizeSel = $('#queuePageSize');
+    if (sizeSel && Number(sizeSel.value) !== queuePageState.pageSize) {
+      sizeSel.value = String(queuePageState.pageSize);
+    }
+    const info = $('#queuePaginationInfo');
+    if (info) {
+      const from = total ? start + 1 : 0;
+      const to = start + shown;
+      const capNote = queuePageState.fetchCapped
+        ? ` <span class="pagination-cap" title="Only the ${QUEUE_FETCH_LIMIT} most recent submissions are loaded.">(first ${QUEUE_FETCH_LIMIT} loaded)</span>`
+        : '';
+      info.innerHTML = `Showing <strong>${from.toLocaleString()}–${to.toLocaleString()}</strong> of <strong>${total.toLocaleString()}</strong>${capNote}`;
+    }
+    const indicator = $('#queuePageIndicator');
+    if (indicator) indicator.textContent = `Page ${queuePageState.page} of ${pageCount}`;
+    const atFirst = queuePageState.page <= 1;
+    const atLast = queuePageState.page >= pageCount;
+    const first = $('#queuePageFirst');
+    const prev = $('#queuePagePrev');
+    const next = $('#queuePageNext');
+    const last = $('#queuePageLast');
+    if (first) first.disabled = atFirst;
+    if (prev) prev.disabled = atFirst;
+    if (next) next.disabled = atLast;
+    if (last) last.disabled = atLast;
+  }
+
+  function goToQueuePage(page) {
+    const next = Number(page);
+    if (!Number.isFinite(next)) return;
+    queuePageState.page = Math.max(1, Math.round(next));
+    renderQueueTable();
+  }
+
+  function wireQueueTableHeaders(table, cols) {
+    table.querySelectorAll('th[data-col]').forEach((th) => {
+      const key = th.dataset.col;
+      const col = cols.find((c) => c.key === key);
+      if (!col) return;
+      const sortEl = th.querySelector('[data-action="sort"]');
+      if (sortEl) {
+        sortEl.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (queueColState.sortField === key) {
+            queueColState.sortDir = queueColState.sortDir === 'asc' ? 'desc' : 'asc';
+          } else {
+            queueColState.sortField = key;
+            queueColState.sortDir = 'asc';
+          }
+          saveQueueSort();
+          queuePageState.page = 1;
+          renderQueueTable();
+        });
+      }
+      const filterEl = th.querySelector('[data-action="filter"]');
+      if (filterEl) {
+        filterEl.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openQueueColumnFilter(key, filterEl);
+        });
+      }
+      if (!col.fixed) {
+        columnUi.wireColumnDrag(th, {
+          canDrag: (el) => {
+            const k = el.dataset.col;
+            return k !== 'select' && k !== 'caret' && k !== 'actions';
+          },
+          onReorder: (srcKey, targetKey, insertBefore) => {
+            applyQueueColumnReorder(srcKey, targetKey, insertBefore);
+          }
+        });
+      }
+    });
+    columnUi.enhanceResize(table);
+  }
+
+  function applyQueueColumnReorder(srcKey, targetKey, insertBefore) {
+    if (srcKey === 'select' || srcKey === 'caret' || srcKey === 'actions' || targetKey === 'select' || targetKey === 'caret' || targetKey === 'actions') return;
+    const visible = visibleQueueColumns().map((c) => c.key);
+    const full = fullQueueColumnOrder();
+    const hidden = full.filter((k) => !visible.includes(k));
+    const order = visible.filter((k) => k !== 'select' && k !== 'caret' && k !== 'actions');
+    const from = order.indexOf(srcKey);
+    if (from < 0) return;
+    order.splice(from, 1);
+    let to = order.indexOf(targetKey);
+    if (to < 0) return;
+    if (!insertBefore) to++;
+    order.splice(to, 0, srcKey);
+    queueColState.order = ['select', 'caret', ...order, 'actions'].concat(hidden.filter((k) => k !== 'select' && k !== 'caret' && k !== 'actions'));
+    saveQueueOrder();
+    renderQueueTable();
+  }
+
+  function openQueueColumnFilter(key, anchor) {
+    const col = QUEUE_COLUMN_DEFS.find((c) => c.key === key);
+    if (!col) return;
+    const counts = new Map();
+    for (const item of queueDisplayItems) {
+      const label = queueFilterValue(item, key);
+      const v = label === '' ? '' : String(label);
+      counts.set(v, (counts.get(v) || 0) + 1);
+    }
+    const values = [...counts.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+      .map(([value, count]) => ({ value, count }));
+    const current = queueColState.filters[key] || new Set();
+    colFilter.open(anchor, {
+      label: col.label,
+      values,
+      selected: current,
+      onApply: (next) => {
+        if (next.size) queueColState.filters[key] = next;
+        else delete queueColState.filters[key];
+        saveQueueFilters();
+        queuePageState.page = 1;
+        renderQueueTable();
+      },
+      onReset: () => {
+        delete queueColState.filters[key];
+        saveQueueFilters();
+        queuePageState.page = 1;
+        renderQueueTable();
+      }
+    });
+  }
+
+  function clearAllQueueColumnFilters() {
+    queueColState.filters = {};
+    saveQueueFilters();
+    queuePageState.page = 1;
+    renderQueueTable();
+  }
+
+  function renderQueueTable() {
+    const table = $('#queueTable');
+    const thead = table && table.querySelector('thead tr');
+    const tbody = table && table.querySelector('tbody');
+    if (!table || !thead || !tbody) return;
+    const cols = visibleQueueColumns();
+    const colCount = cols.length;
+    thead.innerHTML = buildQueueTableHeader(cols);
+    // Filter + sort the WHOLE loaded set first, then page over the result.
+    const filtered = applyQueueFiltersAndSort(queueDisplayItems);
+    const total = filtered.length;
+    const pageSize = queuePageState.pageSize;
+    const pageCount = Math.max(1, Math.ceil(total / pageSize));
+    if (queuePageState.page > pageCount) queuePageState.page = pageCount;
+    if (queuePageState.page < 1) queuePageState.page = 1;
+    const start = (queuePageState.page - 1) * pageSize;
+    const pageItems = filtered.slice(start, start + pageSize);
+    if (!total) {
+      const msg = queueDisplayItems.length
+        ? 'No rows match the current column filters.'
+        : 'No rows.';
+      tbody.innerHTML = `<tr><td colspan="${colCount}" style="text-align:center;color:var(--text-muted);padding:20px;">${msg}</td></tr>`;
+    } else {
+      tbody.innerHTML = pageItems.map((item) => {
+        const attrs = item.type === 'solo'
+          ? ` data-uuid="${esc(item.data.submission_uuid || '')}"`
+          : ` class="group-row" data-group="${esc(item.id)}"`;
+        return `<tr${attrs}>${cols.map((col) => renderQueueCell(item, col)).join('')}</tr>`;
+      }).join('');
+    }
+    renderQueueColumnFiltersBar();
+    renderQueuePagination({ total, start, shown: pageItems.length, pageCount });
+    wireQueueTableHeaders(table, cols);
+    if (queueColSelectorOpen) buildQueueColSelectorList();
+    syncQueueSelectionControls();
+  }
+
+  function syncQueueSelectionControls() {
+    pruneQueueSelection();
+    const visiblePending = visiblePendingQueueUuids();
+    const selectedVisible = visiblePending.filter((uuid) => selectedQueueUuids.has(uuid));
+    const selectedCount = selectedQueueUuids.size;
+    const selectAllRows = $('#selectAllQueueRows');
+    const selectAllBtn = $('#selectAllQueue');
+    const clearBtn = $('#clearQueueSelection');
+    const approveBtn = $('#approveSelectedQueue');
+    const status = $('#queueBulkStatus');
+
+    document.querySelectorAll('#queueTable tbody input.queue-select').forEach((cb) => {
+      const uuids = (cb.dataset.uuids || '').split(',').filter(Boolean);
+      const selectedInRow = uuids.filter((uuid) => selectedQueueUuids.has(uuid));
+      cb.checked = uuids.length > 0 && selectedInRow.length === uuids.length;
+      cb.indeterminate = selectedInRow.length > 0 && selectedInRow.length < uuids.length;
+      cb.disabled = queueBulkBusy || uuids.length === 0;
+    });
+
+    if (selectAllRows) {
+      selectAllRows.disabled = queueBulkBusy || visiblePending.length === 0;
+      selectAllRows.checked = visiblePending.length > 0 && selectedVisible.length === visiblePending.length;
+      selectAllRows.indeterminate = selectedVisible.length > 0 && selectedVisible.length < visiblePending.length;
+    }
+    if (selectAllBtn) {
+      selectAllBtn.disabled = queueBulkBusy || visiblePending.length === 0;
+      selectAllBtn.textContent = visiblePending.length ? `Select all visible (${visiblePending.length})` : 'Select all visible';
+    }
+    if (clearBtn) clearBtn.disabled = queueBulkBusy || selectedCount === 0;
+    if (approveBtn) {
+      approveBtn.disabled = queueBulkBusy || selectedCount === 0;
+      approveBtn.textContent = selectedCount ? `Approve selected (${selectedCount})` : 'Approve selected';
+    }
+    if (status && !queueBulkBusy) {
+      status.textContent = selectedCount ? `${selectedCount} submission${selectedCount === 1 ? '' : 's'} selected` : queueBulkMessage;
+    }
+  }
+
+  function setQueueSelection(uuids, selected) {
+    uuids.forEach((uuid) => {
+      if (!uuid) return;
+      if (selected) selectedQueueUuids.add(uuid);
+      else selectedQueueUuids.delete(uuid);
+    });
+    queueBulkMessage = '';
+    syncQueueSelectionControls();
+  }
+
+  async function approveSelectedQueue() {
+    if (queueBulkBusy) return;
+    pruneQueueSelection();
+    const uuids = [...selectedQueueUuids];
+    if (!uuids.length) return;
+    if (!confirm(`Approve and push ${uuids.length} selected pending submission(s)? They will be queued and pushed to Amazon one at a time.`)) return;
+    const status = $('#queueBulkStatus');
+    queueBulkBusy = true;
+    syncQueueSelectionControls();
+    if (status) status.textContent = 'Queueing approvals...';
+    try {
+      const result = await apiPost('/admin/group/approve', { uuids });
+      selectedQueueUuids.clear();
+      queueBulkMessage = `Queued ${result.approved || 0} approval${result.approved === 1 ? '' : 's'}; skipped ${result.skipped || 0}.`;
+      if (status) status.textContent = queueBulkMessage;
+      await loadQueue();
+      loadJobs();
+    } catch (err) {
+      if (err.message === '401') return;
+      queueBulkMessage = 'Approval failed: ' + err.message;
+      if (status) status.textContent = queueBulkMessage;
+      alert('Approve selected submissions failed: ' + err.message);
+    } finally {
+      queueBulkBusy = false;
+      syncQueueSelectionControls();
+    }
+  }
+
+  function buildQueueColSelectorList() {
+    const list = $('#queueColSelectorList');
+    if (!list) return;
+    const widths = (() => {
+      try { return JSON.parse(localStorage.getItem('aps_queue_col_widths') || '{}'); }
+      catch { return {}; }
+    })();
+    list.innerHTML = fullQueueColumnOrder().map((key) => {
+      const col = QUEUE_COLUMN_DEFS.find((c) => c.key === key);
+      if (!col || !col.label) return '';
+      const checked = !queueColState.hidden.has(key);
+      const w = widths[key];
+      const widthBadge = w ? `<span class="col-width">${Math.round(w)}px</span>` : '';
+      if (col.nohide) {
+        return `<div class="col-selector-item fixed-col"><input type="checkbox" checked disabled /><span class="col-selector-item-label">${esc(col.label)}</span>${widthBadge}</div>`;
+      }
+      return `<label class="col-selector-item"><input type="checkbox" data-col-key="${esc(key)}" ${checked ? 'checked' : ''} /><span class="col-selector-item-label">${esc(col.label)}</span>${widthBadge}</label>`;
+    }).join('');
+    list.querySelectorAll('input[data-col-key]').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const k = cb.dataset.colKey;
+        if (cb.checked) queueColState.hidden.delete(k);
+        else queueColState.hidden.add(k);
+        saveQueueHidden();
+        renderQueueTable();
+      });
+    });
+    const panel = $('#queueColSelectorPanel');
+    if (panel) columnUi.reapplyColSelectorSearch(panel);
+  }
+
+  let queueColSelectorOpen = false;
+  function openQueueColSelector() {
+    const panel = $('#queueColSelectorPanel');
+    const overlay = $('#queueColSelectorOverlay');
+    const btn = $('#queueColSelectorBtn');
+    if (!panel || !overlay || !btn) return;
+    buildQueueColSelectorList();
+    panel.classList.add('open');
+    overlay.classList.add('open');
+    btn.classList.add('active');
+    btn.setAttribute('aria-expanded', 'true');
+    queueColSelectorOpen = true;
+    columnUi.initColSelectorSearch(panel);
+  }
+  function closeQueueColSelector() {
+    const panel = $('#queueColSelectorPanel');
+    const overlay = $('#queueColSelectorOverlay');
+    const btn = $('#queueColSelectorBtn');
+    if (!panel) return;
+    columnUi.clearColSelectorSearch(panel);
+    panel.classList.remove('open');
+    if (overlay) overlay.classList.remove('open');
+    if (btn) {
+      btn.classList.remove('active');
+      btn.setAttribute('aria-expanded', 'false');
+    }
+    queueColSelectorOpen = false;
+  }
+  function toggleQueueColSelector() {
+    if (queueColSelectorOpen) closeQueueColSelector();
+    else openQueueColSelector();
+  }
+  function resetQueueColumns() {
+    queueColState.hidden = new Set();
+    queueColState.order = [];
+    queueColState.sortField = 'created_at';
+    queueColState.sortDir = 'desc';
+    queueColState.filters = {};
+    queuePageState.page = 1;
+    saveQueueHidden();
+    saveQueueOrder();
+    saveQueueSort();
+    saveQueueFilters();
+    const table = $('#queueTable');
+    if (table) columnUi.resetResize(table);
+    renderQueueTable();
   }
 
   // Distinct non-empty values for a field across a group's submissions; renders
@@ -224,47 +948,17 @@
     return `${batch}||${asin}`;
   }
 
-  // A collapsible group header for one item pushed across multiple targets.
-  function renderGroupRow(group) {
-    const { id, items } = group;
-    const vendorCount = new Set(items.map((i) => i.vendor_code).filter(Boolean)).size;
-    const pending = items.filter((i) => i.status === 'PENDING_APPROVAL').length;
-    const updated = items.map((i) => i.updated_at).filter(Boolean).sort().slice(-1)[0] || '';
-    const approvers = [...new Set(items.map((i) => i.approved_by).filter(Boolean))].join(', ');
-    const groupActions = pending
-      ? `<div style="display:inline-flex;gap:4px;align-items:center;">
-          <button class="btn-ghost btn-ghost--success gact approve" data-group="${esc(id)}" data-count="${pending}" title="Approve all pending">${CHECK_SVG} Approve all</button>
-          <button class="btn-ghost btn-ghost--danger gact reject" data-group="${esc(id)}" data-count="${pending}" title="Reject all pending">${X_SVG} Reject all</button>
-        </div>`
-      : '';
-    const vendorLabel = `${vendorCount || items.length} vendor code${(vendorCount || items.length) === 1 ? '' : 's'}`;
-    return `<tr class="group-row" data-group="${esc(id)}">
-      <td class="col-caret"><button class="caret" type="button" data-group="${esc(id)}" aria-label="Show grouped changes">&#9654;</button></td>
-      <td>${esc(items[0].created_at)}</td>
-      <td><span class="group-tag">GROUP</span> <span class="group-pill">${items.length}</span></td>
-      <td>${sharedCell(items, 'caller')}</td><td>${sharedCell(items, 'scope')}</td><td>${sharedCell(items, 'operation')}</td>
-      <td><code>${sharedCell(items, 'asin')}</code></td>
-      <td>${sharedMetaCell(items, 'customer')}</td><td>${sharedMetaCell(items, 'season')}</td><td>${sharedMetaCell(items, 'lifecycle')}</td>
-      <td><span class="group-vendors">${esc(vendorLabel)}</span></td>
-      <td><code>${sharedCell(items, 'item_number')}</code></td>
-      <td><code>${sharedCell(items, 'sku')}</code></td><td>${sharedCell(items, 'marketplace_code')}</td>
-      <td class="group-status">${statusSummary(items)}</td>
-      <td>${esc(approvers)}</td><td>${esc(updated)}</td>
-      <td class="err">${groupErrorCellHtml(items)}</td>
-      <td class="actions">${groupActions}</td></tr>`;
-  }
-
   async function loadQueue() {
     const tbody = $('#queueTable tbody');
     try {
-      const { submissions } = await api('/admin/queue');
+      const { submissions } = await api(`/admin/queue?limit=${QUEUE_FETCH_LIMIT}`);
+      queuePageState.fetchCapped = submissions.length >= QUEUE_FETCH_LIMIT;
       changesCache.clear();
       groupSubs.clear();
       subsByUuid.clear();
       for (const r of submissions) {
         if (r.submission_uuid) subsByUuid.set(r.submission_uuid, r);
       }
-      // Group by item identity + change type, preserving first-seen order.
       const order = [];
       const byKey = new Map();
       for (const r of submissions) {
@@ -273,14 +967,23 @@
         byKey.get(key).items.push(r);
       }
       let gi = 0;
-      tbody.innerHTML = order.map((g) => {
-        if (g.key.startsWith('solo:') || g.items.length < 2) return renderQueueRow(g.items[0]);
+      queueDisplayItems = order.map((g) => {
+        if (g.key.startsWith('solo:') || g.items.length < 2) {
+          return { type: 'solo', data: g.items[0] };
+        }
         const id = 'g' + (gi++);
         groupSubs.set(id, g.items);
-        return renderGroupRow({ id, items: g.items });
-      }).join('') || emptyRow(QUEUE_COLS);
-      applyColVisibility();
-    } catch (e) { if (e.message !== '401') tbody.innerHTML = errRow(QUEUE_COLS, e); }
+        return { type: 'group', id, items: g.items };
+      });
+      queuePageState.page = 1;
+      renderQueueTable();
+    } catch (e) {
+      if (e.message !== '401') {
+        queueDisplayItems = [];
+        tbody.innerHTML = errRow(visibleQueueColCount() || QUEUE_COL_KEYS.length, e);
+        syncQueueSelectionControls();
+      }
+    }
   }
 
   function renderAppliedChanges({ changes, warnings, pushedAt, currentAt, currentSource }) {
@@ -344,7 +1047,7 @@
     row.classList.add('expanded');
     const detail = document.createElement('tr');
     detail.className = 'detail-row';
-    detail.innerHTML = `<td></td><td colspan="${QUEUE_COLS - 1}"><div class="detail-body">Loading changes…</div></td>`;
+    detail.innerHTML = `<td></td><td colspan="${visibleQueueColCount() - 1}"><div class="detail-body">Loading changes…</div></td>`;
     row.insertAdjacentElement('afterend', detail);
     const body = detail.querySelector('.detail-body');
     try {
@@ -352,7 +1055,7 @@
       if (rendered == null) {
         const data = await api(`/admin/submissions/${encodeURIComponent(uuid)}/changes`);
         const sub = subsByUuid.get(uuid);
-        rendered = (sub ? renderMetaBlock(sub.meta) : '') + renderChanges(data);
+        rendered = (sub ? renderCommentBlock(sub.approver_comment) + renderMetaBlock(sub.meta) : '') + renderChanges(data);
         changesCache.set(uuid, rendered);
       }
       if (body) body.innerHTML = rendered;
@@ -368,11 +1071,12 @@
   function renderGroupChanges(data) {
     const subs = (data && data.submissions) || [];
     if (!subs.length) return '<div class="detail-empty">No submissions in this group.</div>';
-    const metaSubs = subs.filter((s) => s.meta && Object.keys(s.meta).some((k) => s.meta[k] != null && s.meta[k] !== ''));
+    const metaSubs = subs.filter((s) => (s.approver_comment && String(s.approver_comment).trim())
+      || (s.meta && Object.keys(s.meta).some((k) => s.meta[k] != null && s.meta[k] !== '')));
     let metaHeader = '';
     if (metaSubs.length) {
       metaHeader = '<div class="meta-block-group">'
-        + metaSubs.map((s) => `<div class="meta-block-row"><div class="meta-block-label"><code>${esc((s.submission_uuid || '').slice(0, 8))}</code> ${esc(s.vendor_code || '')} / ${esc(s.sku || '')}</div>${renderMetaBlock(s.meta)}</div>`).join('')
+        + metaSubs.map((s) => `<div class="meta-block-row"><div class="meta-block-label"><code>${esc((s.submission_uuid || '').slice(0, 8))}</code> ${esc(s.vendor_code || '')} / ${esc(s.sku || '')}</div>${renderCommentBlock(s.approver_comment)}${renderMetaBlock(s.meta)}</div>`).join('')
         + '</div>';
     }
     let rows = '';
@@ -420,7 +1124,7 @@
     row.classList.add('expanded');
     const detail = document.createElement('tr');
     detail.className = 'detail-row';
-    detail.innerHTML = `<td></td><td colspan="${QUEUE_COLS - 1}"><div class="detail-body">Loading changes…</div></td>`;
+    detail.innerHTML = `<td></td><td colspan="${visibleQueueColCount() - 1}"><div class="detail-body">Loading changes…</div></td>`;
     row.insertAdjacentElement('afterend', detail);
     const body = detail.querySelector('.detail-body');
     try {
@@ -439,83 +1143,117 @@
     }
   }
 
-  // ── Column show/hide selector (persisted in localStorage) ─────────────────
-  const COLS_KEY = 'aps_queue_cols';
-  function hiddenCols() {
-    try { return new Set(JSON.parse(localStorage.getItem(COLS_KEY) || '[]')); } catch { return new Set(); }
-  }
-  function saveHiddenCols(set) {
-    localStorage.setItem(COLS_KEY, JSON.stringify([...set]));
-  }
-  // Column indices that must never be hidden (caret + Action). These carry the
-  // expand control and the Approve/Reject buttons, and they have no checkbox in
-  // the column menu — so a stale index landing here would hide them with no way
-  // to restore them from the UI.
-  function nohideCols() {
-    const head = $('#queueTable thead tr');
-    const set = new Set();
-    if (head) Array.from(head.children).forEach((th, idx) => { if (th.hasAttribute('data-nohide')) set.add(idx); });
-    return set;
-  }
-  // Drop any persisted indices that point at a never-hide column (or are out of
-  // range). Self-heals settings saved under an older column layout.
-  function pruneHiddenCols() {
-    const head = $('#queueTable thead tr');
-    if (!head) return;
-    const colCount = head.children.length;
-    const nohide = nohideCols();
-    const hidden = hiddenCols();
-    const cleaned = new Set([...hidden].filter((i) => i < colCount && !nohide.has(i)));
-    if (cleaned.size !== hidden.size) saveHiddenCols(cleaned);
-  }
-  function applyColVisibility() {
-    const hidden = hiddenCols();
-    const nohide = nohideCols();
-    const table = $('#queueTable');
-    if (!table) return;
-    // Only the table's own header/body rows — never the nested bpa-table rows
-    // that live inside an expanded group's detail cell.
-    const rows = table.querySelectorAll(':scope > thead > tr, :scope > tbody > tr');
-    rows.forEach((tr) => {
-      if (tr.classList.contains('detail-row')) return; // colspan cell: leave as-is
-      Array.from(tr.children).forEach((cell, idx) => {
-        cell.classList.toggle('col-hidden', hidden.has(idx) && !nohide.has(idx));
-      });
+  // ── Queue column selector wiring ─────────────────────────────────────────
+  const queueColBtn = $('#queueColSelectorBtn');
+  const queueColOverlay = $('#queueColSelectorOverlay');
+  if (queueColBtn) queueColBtn.addEventListener('click', toggleQueueColSelector);
+  if (queueColOverlay) queueColOverlay.addEventListener('click', closeQueueColSelector);
+  const queueColAutoFit = $('#queueColAutoFit');
+  if (queueColAutoFit) {
+    queueColAutoFit.addEventListener('click', () => {
+      const table = $('#queueTable');
+      if (table) columnUi.autoFitAllColumns(table);
+      buildQueueColSelectorList();
     });
   }
-  function buildColMenu() {
-    const menu = $('#queueCols .colmenu-body');
-    const head = $('#queueTable thead tr');
-    if (!menu || !head) return;
-    const hidden = hiddenCols();
-    const items = Array.from(head.children).map((th, idx) => {
-      if (th.hasAttribute('data-nohide')) return '';
-      const label = th.textContent.trim() || `Col ${idx}`;
-      const checked = hidden.has(idx) ? '' : 'checked';
-      return `<label class="colmenu-item"><input type="checkbox" data-col="${idx}" ${checked}/> ${esc(label)}</label>`;
-    }).join('');
-    menu.innerHTML = items;
-    menu.querySelectorAll('input[data-col]').forEach((cb) => {
-      cb.addEventListener('change', () => {
-        const set = hiddenCols();
-        const idx = Number(cb.dataset.col);
-        if (cb.checked) set.delete(idx); else set.add(idx);
-        saveHiddenCols(set);
-        applyColVisibility();
-      });
+  const queueColReset = $('#queueColReset');
+  if (queueColReset) queueColReset.addEventListener('click', resetQueueColumns);
+  const queueFiltersClear = $('#queueColumnFiltersClear');
+  if (queueFiltersClear) queueFiltersClear.addEventListener('click', clearAllQueueColumnFilters);
+
+  // ── Pagination controls ──────────────────────────────────────────────────
+  loadQueuePageSize();
+  const queuePageSizeSel = $('#queuePageSize');
+  if (queuePageSizeSel) {
+    queuePageSizeSel.value = String(queuePageState.pageSize);
+    queuePageSizeSel.addEventListener('change', () => {
+      const size = Number(queuePageSizeSel.value);
+      if (!QUEUE_PAGE_SIZES.includes(size)) return;
+      queuePageState.pageSize = size;
+      queuePageState.page = 1;
+      saveQueuePageSize();
+      renderQueueTable();
     });
   }
+  const queuePageFirst = $('#queuePageFirst');
+  if (queuePageFirst) queuePageFirst.addEventListener('click', () => goToQueuePage(1));
+  const queuePagePrev = $('#queuePagePrev');
+  if (queuePagePrev) queuePagePrev.addEventListener('click', () => goToQueuePage(queuePageState.page - 1));
+  const queuePageNext = $('#queuePageNext');
+  if (queuePageNext) queuePageNext.addEventListener('click', () => goToQueuePage(queuePageState.page + 1));
+  const queuePageLast = $('#queuePageLast');
+  if (queuePageLast) queuePageLast.addEventListener('click', () => goToQueuePage(Number.MAX_SAFE_INTEGER));
 
   async function loadJobs() {
     const tbody = $('#jobsTable tbody');
     try {
       const { jobs } = await api('/admin/jobs');
-      tbody.innerHTML = jobs.map((j) => `<tr>
-        <td>${esc(j.createdAt)}</td><td><code>${esc((j.jobId || '').slice(0, 8))}</code></td>
+      const approvable = new Set(jobs.filter((j) => Number(j.pendingApprovalCount) > 0).map((j) => j.jobId));
+      for (const id of [...selectedJobIds]) {
+        if (!approvable.has(id)) selectedJobIds.delete(id);
+      }
+      tbody.innerHTML = jobs.map((j) => {
+        const jobId = j.jobId || '';
+        const pendingApprovalCount = Number(j.pendingApprovalCount) || 0;
+        const canApprove = pendingApprovalCount > 0;
+        const checked = selectedJobIds.has(jobId) ? 'checked' : '';
+        const disabled = canApprove ? '' : 'disabled';
+        return `<tr data-job-id="${esc(jobId)}">
+        <td class="select-cell"><input class="job-select" type="checkbox" data-job-id="${esc(jobId)}" ${checked} ${disabled} aria-label="Select job ${esc(jobId.slice(0, 8))}" /></td>
+        <td>${esc(j.createdAt)}</td><td><code title="${esc(jobId)}">${esc(jobId.slice(0, 8))}</code></td>
         <td>${esc(j.kind)}</td><td>${esc(j.caller)}</td><td>${esc(j.asin || '')}</td>
         <td>${esc(j.okCount)}</td><td>${esc(j.failedCount)}</td><td>${esc(j.targetCount)}</td>
-        <td>${statusBadge(j.status)}</td></tr>`).join('') || emptyRow(9);
-    } catch (e) { if (e.message !== '401') tbody.innerHTML = errRow(9, e); }
+        <td>${esc(pendingApprovalCount)}</td><td>${statusBadge(j.status)}</td></tr>`;
+      }).join('') || emptyRow(JOB_COLS);
+      syncJobSelectionControls();
+    } catch (e) { if (e.message !== '401') tbody.innerHTML = errRow(JOB_COLS, e); }
+  }
+
+  function syncJobSelectionControls() {
+    const boxes = Array.from(document.querySelectorAll('#jobsTable tbody input.job-select:not(:disabled)'));
+    const selectedCount = [...selectedJobIds].length;
+    const selectAll = $('#selectAllJobs');
+    const approveBtn = $('#approveSelectedJobs');
+    if (selectAll) {
+      selectAll.disabled = jobBulkBusy || boxes.length === 0;
+      selectAll.checked = boxes.length > 0 && boxes.every((cb) => cb.checked);
+      selectAll.indeterminate = boxes.some((cb) => cb.checked) && !selectAll.checked;
+    }
+    if (approveBtn) {
+      approveBtn.disabled = jobBulkBusy || selectedCount === 0;
+      approveBtn.textContent = selectedCount ? `Approve selected (${selectedCount})` : 'Approve selected';
+    }
+    const status = $('#jobBulkStatus');
+    if (status && !jobBulkBusy) status.textContent = selectedCount ? `${selectedCount} job${selectedCount === 1 ? '' : 's'} selected` : jobBulkMessage;
+  }
+
+  async function approveSelectedJobs() {
+    if (jobBulkBusy) return;
+    const jobIds = [...selectedJobIds];
+    if (!jobIds.length) return;
+    if (!confirm(`Approve pending submissions in ${jobIds.length} selected job(s)? They will be queued and pushed to Amazon one at a time.`)) return;
+    const status = $('#jobBulkStatus');
+    jobBulkBusy = true;
+    syncJobSelectionControls();
+    if (status) status.textContent = 'Queueing approvals...';
+    try {
+      const result = await apiPost('/admin/jobs/approve', { jobIds });
+      selectedJobIds.clear();
+      jobBulkMessage = `Queued ${result.approved || 0} approval${result.approved === 1 ? '' : 's'}; skipped ${result.skipped || 0}.`;
+      if (status) {
+        status.textContent = jobBulkMessage;
+      }
+      await loadJobs();
+      loadQueue();
+    } catch (err) {
+      if (err.message === '401') return;
+      jobBulkMessage = 'Approval failed: ' + err.message;
+      if (status) status.textContent = jobBulkMessage;
+      alert('Approve selected jobs failed: ' + err.message);
+    } finally {
+      jobBulkBusy = false;
+      syncJobSelectionControls();
+    }
   }
 
   async function loadAudit() {
@@ -564,6 +1302,25 @@
   }));
   document.querySelectorAll('.refresh').forEach((b) => b.addEventListener('click', () => loaders[b.dataset.refresh]()));
 
+  $('#jobsTable tbody').addEventListener('change', (e) => {
+    const cb = e.target.closest('input.job-select');
+    if (!cb) return;
+    jobBulkMessage = '';
+    if (cb.checked) selectedJobIds.add(cb.dataset.jobId);
+    else selectedJobIds.delete(cb.dataset.jobId);
+    syncJobSelectionControls();
+  });
+  $('#selectAllJobs').addEventListener('change', (e) => {
+    jobBulkMessage = '';
+    document.querySelectorAll('#jobsTable tbody input.job-select:not(:disabled)').forEach((cb) => {
+      cb.checked = e.target.checked;
+      if (cb.checked) selectedJobIds.add(cb.dataset.jobId);
+      else selectedJobIds.delete(cb.dataset.jobId);
+    });
+    syncJobSelectionControls();
+  });
+  $('#approveSelectedJobs').addEventListener('click', approveSelectedJobs);
+
   // ── Sidebar (hamburger) navigation drawer ────────────────────────────────
   const sidebar = $('#sidebar');
   const overlay = $('#sidebarOverlay');
@@ -606,6 +1363,24 @@
   if (logoutBtn) logoutBtn.addEventListener('click', logout);
 
   $('#auditSubmission').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadAudit(); });
+
+  $('#queueTable').addEventListener('change', (e) => {
+    const selectAllRows = e.target.closest('#selectAllQueueRows');
+    if (selectAllRows) {
+      setQueueSelection(visiblePendingQueueUuids(), selectAllRows.checked);
+      return;
+    }
+    const cb = e.target.closest('input.queue-select');
+    if (!cb) return;
+    setQueueSelection((cb.dataset.uuids || '').split(',').filter(Boolean), cb.checked);
+  });
+  $('#selectAllQueue').addEventListener('click', () => setQueueSelection(visiblePendingQueueUuids(), true));
+  $('#clearQueueSelection').addEventListener('click', () => {
+    selectedQueueUuids.clear();
+    queueBulkMessage = '';
+    syncQueueSelectionControls();
+  });
+  $('#approveSelectedQueue').addEventListener('click', approveSelectedQueue);
 
   // Expand a row to show field-by-field change details. Group rows (carry
   // data-job) expand into the before/posted/after table for the whole job.
@@ -676,8 +1451,7 @@
   }
   api('/admin/me').then((r) => showSession(r.user)).catch(() => {});
 
-  pruneHiddenCols();
-  buildColMenu();
+  loadQueueColState();
   refreshActive();
   setInterval(loadStatus, 30000);
 })();

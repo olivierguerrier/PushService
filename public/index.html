@@ -13,7 +13,7 @@
 <title>Amazon Push Service — console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link rel="stylesheet" href="/styles.css?v=20260611-3" />
+<link rel="stylesheet" href="/styles.css?v=20260616-1" />
 </head>
 <body>
   <aside id="sidebar" class="sidebar">
@@ -86,27 +86,69 @@
     <section class="panel tabview" id="tab-queue">
       <div class="toolbar">
         <h2>Recent submissions</h2>
+        <button id="selectAllQueue" class="bulk-approve" type="button" disabled>Select all visible</button>
+        <button id="clearQueueSelection" class="bulk-approve" type="button" disabled>Unselect</button>
+        <button id="approveSelectedQueue" class="bulk-approve" type="button" disabled>Approve selected</button>
+        <span id="queueBulkStatus" class="bulk-status"></span>
         <button class="refresh" data-refresh="queue">Refresh</button>
-        <details class="colmenu" id="queueCols">
-          <summary>Columns</summary>
-          <div class="colmenu-body"></div>
-        </details>
+        <div class="col-selector-wrapper" id="queueColSelectorWrapper">
+          <button type="button" class="col-selector-btn" id="queueColSelectorBtn" aria-expanded="false">
+            <span class="btn-icon" aria-hidden="true">⊞</span> Columns
+          </button>
+          <div class="col-selector-panel" id="queueColSelectorPanel">
+            <div class="col-selector-header">
+              <span class="col-selector-title">Columns</span>
+              <div class="col-selector-actions">
+                <button type="button" class="col-selector-action-btn" id="queueColAutoFit">Auto-fit</button>
+                <button type="button" class="col-selector-action-btn" id="queueColReset">Reset</button>
+              </div>
+            </div>
+            <div class="col-selector-hint">
+              Drag headers to reorder. Drag right edge to resize. Double-click edge to auto-fit.
+            </div>
+            <div class="col-selector-list" id="queueColSelectorList"></div>
+          </div>
+        </div>
       </div>
-      <div class="tablewrap"><table id="queueTable"><thead><tr>
-        <th class="col-caret" data-nohide></th>
-        <th>Created</th><th>UUID</th><th>Caller</th><th>Scope</th><th>Op</th>
-        <th>ASIN</th><th>Customer</th><th>Season</th><th title="FlyApp lifecycle status (meta.status)">Lifecycle</th>
-        <th>Vendor</th><th>Item #</th><th>SKU</th><th>Mkt</th>
-        <th>Status</th><th>Approved by</th><th>Updated</th><th>Error</th>
-        <th data-nohide>Action</th>
-      </tr></thead><tbody></tbody></table></div>
+      <div id="queueColumnFiltersBar" class="column-filters-bar hidden">
+        <span id="queueColumnFiltersBarText"></span>
+        <button type="button" class="column-filters-clear" id="queueColumnFiltersClear">Clear all</button>
+      </div>
+      <div class="tablewrap"><table id="queueTable" data-col-widths-key="aps_queue_col_widths"><thead><tr></tr></thead><tbody></tbody></table></div>
+      <div id="queuePagination" class="pagination-bar hidden">
+        <div class="pagination-info" id="queuePaginationInfo"></div>
+        <div class="pagination-controls">
+          <label class="pagination-size">Rows per page
+            <select id="queuePageSize" aria-label="Rows per page">
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+            </select>
+          </label>
+          <div class="pagination-nav">
+            <button type="button" id="queuePageFirst" class="pagination-btn" aria-label="First page" title="First page">&laquo;</button>
+            <button type="button" id="queuePagePrev" class="pagination-btn" aria-label="Previous page" title="Previous page">&lsaquo;</button>
+            <span id="queuePageIndicator" class="pagination-indicator"></span>
+            <button type="button" id="queuePageNext" class="pagination-btn" aria-label="Next page" title="Next page">&rsaquo;</button>
+            <button type="button" id="queuePageLast" class="pagination-btn" aria-label="Last page" title="Last page">&raquo;</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section class="panel tabview hidden" id="tab-jobs">
-      <div class="toolbar"><h2>Recent jobs</h2><button class="refresh" data-refresh="jobs">Refresh</button></div>
+      <div class="toolbar">
+        <h2>Recent jobs</h2>
+        <button id="approveSelectedJobs" class="bulk-approve" type="button" disabled>Approve selected</button>
+        <span id="jobBulkStatus" class="bulk-status"></span>
+        <button class="refresh" data-refresh="jobs">Refresh</button>
+      </div>
       <div class="tablewrap"><table id="jobsTable"><thead><tr>
+        <th class="select-cell"><input id="selectAllJobs" type="checkbox" aria-label="Select all approvable jobs" /></th>
         <th>Created</th><th>Job</th><th>Kind</th><th>Caller</th><th>ASIN</th>
-        <th>OK</th><th>Failed</th><th>Total</th><th>Status</th>
+        <th>OK</th><th>Failed</th><th>Total</th><th>Pending approval</th><th>Status</th>
       </tr></thead><tbody></tbody></table></div>
     </section>
 
@@ -125,6 +167,9 @@
   </main>
   </div>
 
-  <script src="/app.js?v=20260611-3"></script>
+  <div class="col-selector-overlay" id="queueColSelectorOverlay"></div>
+  <script src="/col-filter.js?v=20260616-1"></script>
+  <script src="/column-ui.js?v=20260616-1"></script>
+  <script src="/app.js?v=20260616-1"></script>
 </body>
 </html>
