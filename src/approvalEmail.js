@@ -16,6 +16,15 @@ function render(template, vars) {
   return template.replace(/\{\{(\w+)\}\}/g, (_, key) => escapeHtml(vars[key]));
 }
 
+// Build the optional "Note from requester" block (escaped, preserves line
+// breaks). Returns '' when there is no comment so the template collapses it.
+function renderCommentBlock(comment) {
+  const text = String(comment == null ? '' : comment).trim();
+  if (!text) return '';
+  return `<h3 style="margin: 0 0 8px 0; font-size: 20px; font-weight: 600; color: #1F2328;">Note from requester</h3>
+      <div style="background: #FFF5CC; border: 1px solid #f0e0a8; border-radius: 12px; padding: 12px; font-size: 14px; white-space: pre-wrap; word-break: break-word; margin-bottom: 24px;">${escapeHtml(text)}</div>`;
+}
+
 function previewValue(val) {
   let s;
   try { s = JSON.stringify(val, null, 2); } catch { s = String(val); }
@@ -64,10 +73,10 @@ async function sendApprovalEmail({ submission, requestBody }) {
     approveUrl,
     rejectUrl,
     ttlMinutes: String(env.APPROVAL_TTL_MIN)
-  });
+  }).replace('<!--COMMENT_BLOCK-->', renderCommentBlock(submission.approver_comment));
 
   const subject = `[Amazon push] ${submission.scope} approval — ${submission.asin || ''} ${submission.marketplace_code || ''}`.trim();
   return sendMail({ to: env.APPROVERS, subject, html });
 }
 
-module.exports = { sendApprovalEmail, formatPatchSummary, formatFeedSummary };
+module.exports = { sendApprovalEmail, formatPatchSummary, formatFeedSummary, renderCommentBlock };

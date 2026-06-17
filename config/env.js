@@ -122,6 +122,42 @@ module.exports = {
   get APPROVERS() { return list('APPROVERS'); },
   get APPROVAL_TTL_MIN() { return int('APPROVAL_TTL_MIN', 60 * 24); },
 
+  // Transient SP-API internal-error (code 4000000) retry. Amazon documents this
+  // as a generic "internal error — try again" and recommends up to two retries
+  // before opening a support ticket. The forwarder re-submits the SAME patch on
+  // a 4000000 result, backing off between attempts.
+  get SPAPI_INTERNAL_RETRY_MAX() { return Math.max(0, int('SPAPI_INTERNAL_RETRY_MAX', 2)); },
+  get SPAPI_INTERNAL_RETRY_BACKOFF_MS() {
+    const nums = list('SPAPI_INTERNAL_RETRY_BACKOFF_MS')
+      .map((v) => parseInt(v, 10))
+      .filter((n) => Number.isFinite(n) && n >= 0);
+    return nums.length ? nums : [1000, 3000];
+  },
+
+  // Outbound SP-API load balancing. A client-side token bucket (one per
+  // region+operation) paces requests so we stay under Amazon's per-operation
+  // rate limit instead of bursting into HTTP 429s. RATE = steady requests/sec,
+  // BURST = bucket capacity. Each bucket self-tunes to the live allocation
+  // Amazon advertises in the `x-amzn-RateLimit-Limit` response header, so these
+  // are conservative starting points rather than hard ceilings.
+  get SPAPI_RATE_LIMIT_ENABLED() { return bool('SPAPI_RATE_LIMIT_ENABLED', true); },
+  get SPAPI_RATE_LIMIT_RATE() {
+    const n = Number.parseFloat(process.env.SPAPI_RATE_LIMIT_RATE);
+    return Number.isFinite(n) && n > 0 ? n : 5;
+  },
+  get SPAPI_RATE_LIMIT_BURST() { return Math.max(1, int('SPAPI_RATE_LIMIT_BURST', 10)); },
+  // When Amazon still returns 429 (e.g. a shared pool drained by another
+  // client), the client waits and retries the SAME request in place, honouring
+  // a `Retry-After` header when present and otherwise stepping through this
+  // backoff. Set MAX to 0 to disable in-client 429 retries.
+  get SPAPI_RATE_LIMIT_429_RETRY_MAX() { return Math.max(0, int('SPAPI_RATE_LIMIT_429_RETRY_MAX', 3)); },
+  get SPAPI_RATE_LIMIT_429_BACKOFF_MS() {
+    const nums = list('SPAPI_RATE_LIMIT_429_BACKOFF_MS')
+      .map((v) => parseInt(v, 10))
+      .filter((n) => Number.isFinite(n) && n >= 0);
+    return nums.length ? nums : [1000, 2000, 5000];
+  },
+
   // 1P-vendor attributes that are valid on Amazon but absent from the public
   // seller LISTING product-type schema (e.g. `procurement`, which carries
   // replenishment_status). The package validator forwards these to Amazon
@@ -163,9 +199,32 @@ module.exports = {
   get CONTENT_SOURCE_URL() { return str('CONTENT_SOURCE_URL'); },
   get CONTENT_SOURCE_TOKEN() { return str('CONTENT_SOURCE_TOKEN'); },
 
+  // ── AI error resolver (OpenAI) ─────────────────────────────────────────────
+  // Mirrors FlyApp's OpenAI setup. The resolver reviews FAILED submissions,
+  // diagnoses the Amazon error, and drafts a corrected SP-API package for an
+  // operator to approve. Read live so a vault rotation is picked up.
+  // The feature is OFF unless an API key is present AND OPENAI_RESOLVER_ENABLED
+  // is not explicitly turned off.
+  get OPENAI_API_KEY() { return str('OPENAI_API_KEY'); },
+  get OPENAI_MODEL() { return str('OPENAI_MODEL', 'gpt-5.4-mini'); },
+  get OPENAI_RESOLVER_ENABLED() {
+    // Default ON whenever a key is configured; an explicit false disables it.
+    if (!str('OPENAI_API_KEY')) return false;
+    return bool('OPENAI_RESOLVER_ENABLED', true);
+  },
+
   // Poller
   get POLLER_CRON() { return str('POLLER_CRON', '*/2 * * * *'); },
   get JOB_STALE_MINUTES() { return int('JOB_STALE_MINUTES', 15); },
+  // A feed submission whose status read (getFeed) keeps failing can never settle
+  // and would be re-polled forever. After this many consecutive poll errors the
+  // poller abandons it as FAILED rather than looping indefinitely.
+  get POLLER_MAX_FEED_ERRORS() { return Math.max(1, int('POLLER_MAX_FEED_ERRORS', 10)); },
+
+  // Boot guard: refuse to start if unit-test fixtures (caller='test') are found
+  // in the database, which means tests or a script ran against a real DB. Set
+  // true only to deliberately bypass (e.g. a sanctioned fixture environment).
+  get ALLOW_TEST_ROWS() { return bool('ALLOW_TEST_ROWS', false); },
 
   // Over-time reconciliation: after a write APPLIES, schedule SP-API read-backs
   // to confirm the data is still reflected live on Amazon.

@@ -16,6 +16,14 @@ const targetSchema = z.object({
   sellerId: z.string().min(1).optional().nullable(),
   vendorCode: z.string().min(1).optional().nullable(),
   sku: z.string().min(1).optional().nullable(),
+  // Parent vendor code's SKU, supplied by the caller (FlyApp). Some listings
+  // are registered under a parent vendor code's SKU even though the target
+  // vendor code's documented SKU (from SP-API / the vendor xlsx) is different
+  // (often equal to the ASIN). When Amazon rejects the documented SKU with the
+  // "can't change Vendor SKU from its original value" error (101168), the
+  // forwarder retries the SAME vendor code using this parent SKU.
+  parentSku: z.string().min(1).optional().nullable(),
+  parentVendorSku: z.string().min(1).optional().nullable(),
   itemNumber: z.string().min(1).optional().nullable(),
   productId: z.union([z.string(), z.number()]).optional().nullable(),
   marketplaceCode: z.string().min(2),
@@ -28,7 +36,11 @@ const targetSchema = z.object({
   // lifecycle status, etc.) without it ever influencing payload-building,
   // approval policy, or anything sent to Amazon.
   meta: z.record(z.any()).optional().nullable()
-}).transform((t) => ({ ...t, sellerId: t.sellerId || t.vendorCode || null }));
+}).transform((t) => ({
+  ...t,
+  sellerId: t.sellerId || t.vendorCode || null,
+  parentSku: t.parentSku || t.parentVendorSku || null
+}));
 
 const previewSchema = targetSchema;
 
@@ -36,6 +48,11 @@ const pushSchema = z.object({
   scope: z.string().min(1).default('VCFIX'),
   fieldNames: z.array(z.string()).optional().nullable(),
   label: z.string().optional().nullable(),
+  // One free-text note from the requester for the human approver. Descriptive
+  // only — surfaced in the approval email, approval page, console, and audit;
+  // never influences payload-building, approval policy, or anything sent to
+  // Amazon. Applies to every submission the push creates.
+  comment: z.string().trim().max(2000).optional().nullable(),
   operation: z.enum(['patchItem', 'submitJsonListingsFeed']).default('patchItem'),
   targets: z.array(targetSchema).min(1)
 });
@@ -71,6 +88,8 @@ const packageTargetSchema = targetSchema.and(z.object({ package: packageSchema }
 const pushPackageSchema = z.object({
   scope: z.string().min(1).default('VCFIX'),
   label: z.string().optional().nullable(),
+  // See pushSchema.comment — requester note for the approver, descriptive only.
+  comment: z.string().trim().max(2000).optional().nullable(),
   operation: z.enum(['patchItem', 'submitJsonListingsFeed']).default('patchItem'),
   allowUnknownAttributes: z.boolean().optional().default(false),
   targets: z.array(packageTargetSchema).min(1)

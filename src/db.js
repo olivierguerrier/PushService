@@ -126,6 +126,37 @@ function ensureSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_recon_due ON reconciliation_checks(status, scheduled_at);
     CREATE INDEX IF NOT EXISTS idx_recon_submission ON reconciliation_checks(submission_uuid);
 
+    -- AI error resolutions: one latest LLM review per FAILED submission. The
+    -- model diagnoses the Amazon error and drafts a corrected SP-API package;
+    -- an operator reviews/edits/approves it in the console, at which point a NEW
+    -- push_submissions row (linked back via resolves_uuid) is forwarded. This
+    -- table only stores the proposal + its lifecycle; the audit trail
+    -- (audit_events) remains the immutable record of every review/apply/reject.
+    CREATE TABLE IF NOT EXISTS ai_resolutions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      submission_uuid TEXT UNIQUE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PROPOSED',
+      diagnosis TEXT,
+      root_cause TEXT,
+      confidence INTEGER,
+      resolvable INTEGER NOT NULL DEFAULT 0,
+      operation TEXT,
+      proposed_package_json TEXT,
+      changed_attr_names_json TEXT,
+      unresolved_json TEXT,
+      warnings_json TEXT,
+      validation_json TEXT,
+      model TEXT,
+      input_hash TEXT,
+      error_message TEXT,
+      applied_submission_uuid TEXT,
+      reviewed_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_res_status ON ai_resolutions(status);
+    CREATE INDEX IF NOT EXISTS idx_ai_res_submission ON ai_resolutions(submission_uuid);
+
     -- Immutability: the audit trail is insert-only. These triggers make
     -- UPDATE / DELETE impossible at the database level.
     CREATE TRIGGER IF NOT EXISTS audit_events_no_update
@@ -148,7 +179,34 @@ function migrateColumns(db) {
       // The exact JSON the caller submitted, before any normalization — kept verbatim for audit fidelity.
       { name: 'raw_package_json', ddl: 'raw_package_json TEXT' },
       // Free-form caller metadata (customer, season, lifecycle status, etc.). Descriptive only.
-      { name: 'flyapp_meta_json', ddl: 'flyapp_meta_json TEXT' }
+      { name: 'flyapp_meta_json', ddl: 'flyapp_meta_json TEXT' },
+      // Caller-supplied parent vendor code SKU — used as the fallback path SKU
+      // when Amazon rejects the documented SKU with vendor_sku error 101168.
+      { name: 'parent_sku', ddl: 'parent_sku TEXT' },
+      // The SKU the write actually used at Amazon. NULL means the documented
+      // `sku` was used; set to the parent SKU when the vendor_sku fallback fired.
+      // Reconciliation/revert target this when present so they hit the listing
+      // that was really written.
+      { name: 'effective_sku', ddl: 'effective_sku TEXT' },
+      // Requester's free-text note for the human approver (one per push, copied
+      // onto every submission it creates). Descriptive only — shown in the
+      // approval email/page, console, and audit; never sent to Amazon.
+      { name: 'approver_comment', ddl: 'approver_comment TEXT' },
+      // package_level is deferred: never sent on the initial write, only re-added
+      // when Amazon rejects with a package_level-referencing issue. This flag is
+      // set to 1 once we resubmit WITH package_level included, and guards against
+      // re-add loops (feeds) and keeps reconciliation from expecting an attribute
+      // we never sent.
+      { name: 'package_level_readded', ddl: 'package_level_readded INTEGER NOT NULL DEFAULT 0' },
+      // When this submission is an AI-resolved re-push of a previously FAILED
+      // submission, this points back to that original submission_uuid (analogous
+      // to revert_of_uuid). NULL for ordinary pushes.
+      { name: 'resolves_uuid', ddl: 'resolves_uuid TEXT' },
+      // Consecutive feed-status poll errors for an async feed submission. The
+      // poller increments this when getFeed throws and abandons the submission
+      // as FAILED once it crosses POLLER_MAX_FEED_ERRORS, so an unpollable feed
+      // can't loop forever. Reset to 0 on any successful status read.
+      { name: 'poll_error_count', ddl: 'poll_error_count INTEGER NOT NULL DEFAULT 0' }
     ]
   };
   for (const [table, cols] of Object.entries(ADDITIONS)) {

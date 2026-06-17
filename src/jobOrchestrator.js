@@ -22,13 +22,15 @@ function recomputeJobStatus(jobUuid) {
     else if (TERMINAL_FAIL.has(r.status)) failed += 1;
     else if (PENDING.has(r.status)) pending += 1;
   }
+  const targetTotal = Math.max(Number(job.target_count) || 0, rows.length);
+  const fanOutComplete = rows.length >= targetTotal && targetTotal > 0;
   let status = 'running';
-  if (pending === 0) {
+  if (pending === 0 && fanOutComplete) {
     if (failed === 0 && ok > 0) status = 'completed';
     else if (ok === 0) status = 'failed';
     else status = 'partial';
   }
-  const fields = { ok_count: ok, failed_count: failed, target_count: rows.length, status };
+  const fields = { ok_count: ok, failed_count: failed, target_count: targetTotal, status };
   if (status !== 'running' && !job.completed_at) fields.completed_at = new Date().toISOString();
   const updated = jobs.update(jobUuid, fields);
   if (status !== job.status && status !== 'running') {

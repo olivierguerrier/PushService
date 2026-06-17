@@ -24,6 +24,7 @@ const { recomputeJobStatus } = require('../src/jobOrchestrator');
 const { sendApprovalEmail } = require('../src/approvalEmail');
 const translator = require('../src/translator');
 const packageValidator = require('../src/packageValidator');
+const { buildRequestBody } = require('../src/packageRequestBody');
 const listingsItems = require('../src/spapi/listingsItems');
 const reconciliation = require('../src/reconciliation');
 const listingAppClient = require('../src/sot/listingAppClient');
@@ -126,7 +127,16 @@ router.post('/', bearerAuth, writeGate, async (req, res, next) => {
       marketplaceCode: parsed.targets.length === 1 ? first.marketplaceCode : null,
       productType: first.productType || null,
       label: parsed.label || null,
-      requestPayload: { scope: parsed.scope, operation: parsed.operation, targetCount: parsed.targets.length },
+      requestPayload: {
+        path: 'push',
+        scope: parsed.scope,
+        operation: parsed.operation,
+        targetCount: parsed.targets.length,
+        targets: parsed.targets,
+        fieldNames: parsed.fieldNames || null,
+        label: parsed.label || null,
+        comment: parsed.comment || null
+      },
       fieldNames: parsed.fieldNames || null,
       targetCount: parsed.targets.length
     });
@@ -168,7 +178,17 @@ router.post('/package', bearerAuth, writeGate, async (req, res, next) => {
       marketplaceCode: parsed.targets.length === 1 ? first.marketplaceCode : null,
       productType: first.productType || null,
       label: parsed.label || null,
-      requestPayload: { scope: parsed.scope, operation: parsed.operation, targetCount: parsed.targets.length, origin: 'flyapp_prebuilt' },
+      requestPayload: {
+        path: 'package',
+        scope: parsed.scope,
+        operation: parsed.operation,
+        targetCount: parsed.targets.length,
+        targets: parsed.targets,
+        label: parsed.label || null,
+        comment: parsed.comment || null,
+        allowUnknownAttributes: parsed.allowUnknownAttributes,
+        origin: 'flyapp_prebuilt'
+      },
       targetCount: parsed.targets.length
     });
     jobs.update(jobUuid, { status: 'running', started_at: new Date().toISOString() });
@@ -355,9 +375,12 @@ async function handlePackageTarget({ req, jobUuid, parsed, target, listingAppAsi
     }
   }
 
-  const requestBody = parsed.operation === 'submitJsonListingsFeed'
-    ? { marketplaceCode, payload: validated.sanitizedPackage, changedAttrNames: validated.changedAttrNames, productType: effectiveProductType }
-    : { productType: effectiveProductType, patches: validated.sanitizedPackage.patches, changedAttrNames: validated.changedAttrNames };
+  const requestBody = buildRequestBody({
+    operation: parsed.operation,
+    marketplaceCode,
+    productType: effectiveProductType,
+    validated
+  });
 
   const policy = approvalPolicy.resolve({ scope: parsed.scope, caller: req.caller });
   const submissionUuid = newUuid();
@@ -368,10 +391,12 @@ async function handlePackageTarget({ req, jobUuid, parsed, target, listingAppAsi
   try {
     submission = submissions.insert({
       submissionUuid, jobUuid, idempotencyKey: idemKey, caller: req.caller, scope: policy.scope,
-      operation: parsed.operation, vendorCode: target.sellerId, sku: target.sku, asin: target.asin,
+      operation: parsed.operation, vendorCode: target.sellerId, sku: target.sku, parentSku: target.parentSku,
+      asin: target.asin,
       itemNumber: target.itemNumber, marketplaceCode, productType: effectiveProductType,
       requestBody, status: initialStatus, approvalToken,
-      payloadOrigin: 'flyapp_prebuilt', rawPackage: target.package, flyappMeta: target.meta
+      payloadOrigin: 'flyapp_prebuilt', rawPackage: target.package, flyappMeta: target.meta,
+      approverComment: parsed.comment
     });
   } catch (e) {
     if (idemKey && /UNIQUE/i.test(String(e.message))) {
@@ -380,7 +405,7 @@ async function handlePackageTarget({ req, jobUuid, parsed, target, listingAppAsi
     }
     throw e;
   }
-  audit.record({ event: 'received', submissionUuid, jobUuid, actor: req.caller, details: { scope: policy.scope, policy: policy.policy, origin: 'flyapp_prebuilt', changedAttrNames: validated.changedAttrNames } });
+  audit.record({ event: 'received', submissionUuid, jobUuid, actor: req.caller, details: { scope: policy.scope, policy: policy.policy, origin: 'flyapp_prebuilt', changedAttrNames: validated.changedAttrNames, comment: parsed.comment || null } });
 
   if (policy.policy === 'auto') {
     audit.record({ event: 'auto_approved', submissionUuid, jobUuid, actor: 'system' });
@@ -503,10 +528,11 @@ async function handleTarget({ req, jobUuid, parsed, target, listingAppAsinGate =
   try {
     submission = submissions.insert({
       submissionUuid, jobUuid, idempotencyKey: idemKey, caller: req.caller, scope: policy.scope,
-      operation: parsed.operation, vendorCode: plan.sellerId, sku: plan.sku, asin: plan.asin,
+      operation: parsed.operation, vendorCode: plan.sellerId, sku: plan.sku, parentSku: target.parentSku,
+      asin: plan.asin,
       itemNumber: plan.itemNumber, marketplaceCode: plan.marketplaceCode, productType: plan.productType,
       sourceHash: plan.sourceHash, sourceSnapshot: plan.snapshot, requestBody, status: initialStatus, approvalToken,
-      flyappMeta: target.meta
+      flyappMeta: target.meta, approverComment: parsed.comment
     });
   } catch (e) {
     if (idemKey && /UNIQUE/i.test(String(e.message))) {
@@ -515,7 +541,7 @@ async function handleTarget({ req, jobUuid, parsed, target, listingAppAsinGate =
     }
     throw e;
   }
-  audit.record({ event: 'received', submissionUuid, jobUuid, actor: req.caller, details: { scope: policy.scope, policy: policy.policy, sourceHash: plan.sourceHash, changedAttrNames: plan.changedAttrNames } });
+  audit.record({ event: 'received', submissionUuid, jobUuid, actor: req.caller, details: { scope: policy.scope, policy: policy.policy, sourceHash: plan.sourceHash, changedAttrNames: plan.changedAttrNames, comment: parsed.comment || null } });
 
   if (policy.policy === 'auto') {
     audit.record({ event: 'auto_approved', submissionUuid, jobUuid, actor: 'system' });
@@ -585,7 +611,8 @@ router.post('/revert/:uuid', bearerAuth, writeGate, async (req, res, next) => {
     const requestBody = { productType: original.product_type, patches: revertPatches, changedAttrNames: changed };
     const submission = submissions.insert({
       submissionUuid, jobUuid, caller: req.caller, scope: 'REVERT', operation: 'patchItem',
-      vendorCode: original.vendor_code, sku: original.sku, asin: original.asin, itemNumber: original.item_number,
+      vendorCode: original.vendor_code, sku: original.effective_sku || original.sku, parentSku: original.parent_sku,
+      asin: original.asin, itemNumber: original.item_number,
       marketplaceCode: original.marketplace_code, productType: original.product_type,
       requestBody, status: initialStatus, approvalToken, revertOfUuid: original.submission_uuid
     });
@@ -611,3 +638,8 @@ router.post('/revert/:uuid', bearerAuth, writeGate, async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.pushHandlers = {
+  handleTarget,
+  handlePackageTarget,
+  loadContentMatchAsinGate
+};

@@ -5,25 +5,25 @@ const { getDb } = require('./db');
 
 function insert({
   submissionUuid, jobUuid = null, idempotencyKey = null, caller, scope, operation,
-  vendorCode = null, sku = null, asin = null, itemNumber = null, marketplaceCode = null,
+  vendorCode = null, sku = null, parentSku = null, asin = null, itemNumber = null, marketplaceCode = null,
   productType = null, sourceHash = null, sourceSnapshot = null, requestBody, priorState = null,
   status, approvalToken = null, revertOfUuid = null, payloadOrigin = 'built', rawPackage = null,
-  flyappMeta = null
+  flyappMeta = null, approverComment = null, resolvesUuid = null
 }) {
   const db = getDb();
   db.prepare(`
     INSERT INTO push_submissions (
       submission_uuid, job_uuid, idempotency_key, caller, scope, operation,
-      vendor_code, sku, asin, item_number, marketplace_code, product_type,
+      vendor_code, sku, parent_sku, asin, item_number, marketplace_code, product_type,
       source_hash, source_snapshot_json, request_body_json, prior_state_json,
       status, approval_token, revert_of_uuid, payload_origin, raw_package_json,
-      flyapp_meta_json
+      flyapp_meta_json, approver_comment, resolves_uuid
     ) VALUES (
       @submission_uuid, @job_uuid, @idempotency_key, @caller, @scope, @operation,
-      @vendor_code, @sku, @asin, @item_number, @marketplace_code, @product_type,
+      @vendor_code, @sku, @parent_sku, @asin, @item_number, @marketplace_code, @product_type,
       @source_hash, @source_snapshot_json, @request_body_json, @prior_state_json,
       @status, @approval_token, @revert_of_uuid, @payload_origin, @raw_package_json,
-      @flyapp_meta_json
+      @flyapp_meta_json, @approver_comment, @resolves_uuid
     )
   `).run({
     submission_uuid: submissionUuid,
@@ -34,6 +34,7 @@ function insert({
     operation,
     vendor_code: vendorCode,
     sku,
+    parent_sku: parentSku,
     asin,
     item_number: itemNumber,
     marketplace_code: marketplaceCode,
@@ -47,7 +48,9 @@ function insert({
     revert_of_uuid: revertOfUuid,
     payload_origin: payloadOrigin || 'built',
     raw_package_json: rawPackage == null ? null : (typeof rawPackage === 'string' ? rawPackage : JSON.stringify(rawPackage)),
-    flyapp_meta_json: flyappMeta == null ? null : (typeof flyappMeta === 'string' ? flyappMeta : JSON.stringify(flyappMeta))
+    flyapp_meta_json: flyappMeta == null ? null : (typeof flyappMeta === 'string' ? flyappMeta : JSON.stringify(flyappMeta)),
+    approver_comment: approverComment == null || approverComment === '' ? null : String(approverComment),
+    resolves_uuid: resolvesUuid || null
   });
   return getByUuid(submissionUuid);
 }
@@ -66,7 +69,8 @@ function getByApprovalToken(token) {
 
 const UPDATABLE = [
   'status', 'amazon_response_json', 'issues_json', 'prior_state_json',
-  'approved_by', 'approved_at', 'error_message', 'feed_id', 'feed_document_id'
+  'approved_by', 'approved_at', 'error_message', 'feed_id', 'feed_document_id',
+  'effective_sku', 'package_level_readded', 'poll_error_count'
 ];
 
 function update(uuid, fields = {}) {
@@ -87,19 +91,56 @@ function update(uuid, fields = {}) {
   return getByUuid(uuid);
 }
 
-function listRecent({ limit = 200 } = {}) {
+// Recent submissions, newest first. Supports keyset (cursor) pagination via
+// `beforeId`: pass the `id` of the last row from the previous page to fetch the
+// next, older batch. Keyset is used instead of OFFSET so concurrent inserts
+// (which always land at the top with a higher id) can't shift the window and
+// cause rows to be skipped or duplicated across pages.
+function listRecent({ limit = 200, beforeId = null } = {}) {
   const cap = Math.max(1, Math.min(1000, Number(limit) || 200));
-  return getDb().prepare(`
-    SELECT submission_uuid, job_uuid, caller, scope, operation, vendor_code, sku,
-           asin, item_number, marketplace_code, status, approved_by, approved_at,
+  const cursor = beforeId == null ? null : Number(beforeId);
+  const cols = `id, submission_uuid, job_uuid, caller, scope, operation, vendor_code, sku,
+           parent_sku, effective_sku, asin, item_number, marketplace_code, status,
+           approved_by, approved_at,
            error_message, issues_json, amazon_response_json, created_at, updated_at,
-           flyapp_meta_json
+           flyapp_meta_json, approver_comment`;
+  if (cursor != null && Number.isFinite(cursor)) {
+    return getDb().prepare(`
+      SELECT ${cols}
+      FROM push_submissions WHERE id < ? ORDER BY id DESC LIMIT ${cap}
+    `).all(cursor);
+  }
+  return getDb().prepare(`
+    SELECT ${cols}
     FROM push_submissions ORDER BY id DESC LIMIT ${cap}
   `).all();
+}
+
+function count() {
+  return getDb().prepare('SELECT COUNT(*) AS n FROM push_submissions').get().n;
 }
 
 function listForJob(jobUuid) {
   return getDb().prepare('SELECT * FROM push_submissions WHERE job_uuid = ? ORDER BY id ASC').all(jobUuid);
 }
 
-module.exports = { insert, getByUuid, getByIdempotencyKey, getByApprovalToken, update, listRecent, listForJob };
+// Every submission that carries an Amazon error/diagnostic: explicit FAILED
+// rows, anything with an error_message, or a non-empty issues_json (which may
+// also hold WARNING-level diagnostics worth exporting). Includes the raw
+// issues_json / amazon_response_json blobs so callers can distil full codes.
+function listErrors({ limit = 1000 } = {}) {
+  const cap = Math.max(1, Math.min(5000, Number(limit) || 1000));
+  return getDb().prepare(`
+    SELECT submission_uuid, job_uuid, caller, scope, operation, vendor_code, sku,
+           parent_sku, effective_sku, asin, item_number, marketplace_code, product_type,
+           status, approved_by, approved_at, error_message, issues_json,
+           amazon_response_json, feed_id, feed_document_id, created_at, updated_at
+    FROM push_submissions
+    WHERE status = 'FAILED'
+       OR (error_message IS NOT NULL AND error_message != '')
+       OR (issues_json IS NOT NULL AND issues_json != '' AND issues_json != '[]')
+    ORDER BY id DESC LIMIT ${cap}
+  `).all();
+}
+
+module.exports = { insert, getByUuid, getByIdempotencyKey, getByApprovalToken, update, listRecent, count, listForJob, listErrors };

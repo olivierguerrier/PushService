@@ -6,22 +6,33 @@
 //   GET  /admin/status       admin: config + dependency health snapshot.
 //   GET  /admin/queue        admin: recent submissions (JSON, for the UI).
 //   GET  /admin/jobs         admin: recent jobs (JSON, for the UI).
+const crypto = require('crypto');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const env = require('../config/env');
 const { adminAuth, serviceTokens, signAdminJwt, verifyCredentials, TOKEN_TTL_SECONDS } = require('../middleware/auth');
+const { writeGate } = require('../middleware/writeGate');
 const submissions = require('../src/submissions');
+const errorReport = require('../src/errorReport');
 const changeDetails = require('../src/changeDetails');
 const jobs = require('../src/jobs');
 const reconciliation = require('../src/reconciliation');
 const audit = require('../src/audit/auditEvents');
-const forwarder = require('../src/forwarder');
+const approvalQueue = require('../src/approvalQueue');
+const metrics = require('../src/metrics');
 const { recomputeJobStatus } = require('../src/jobOrchestrator');
 const la = require('../src/sot/listingAppClient');
 const contentSource = require('../src/sot/contentSource');
 const spClient = require('../src/spapi/client');
+const aiResolver = require('../src/aiResolver');
+const aiResolutions = require('../src/aiResolutions');
+const packageValidator = require('../src/packageValidator');
+const { buildRequestBody } = require('../src/packageRequestBody');
+const forwarder = require('../src/forwarder');
+const { resolveByCode } = require('../config/marketplaces');
 
 const router = express.Router();
+const newUuid = () => crypto.randomUUID();
 
 // IP-based throttle on /admin/login. Successful logins still count so a
 // compromised credential can't replay at full speed.
@@ -96,6 +107,13 @@ router.get('/admin/me', adminAuth, (req, res) => {
   res.json({ user: req.admin || (req.caller ? { username: req.caller, role: 'service' } : null) });
 });
 
+router.get('/admin/metrics', adminAuth, (req, res) => {
+  res.json({
+    ...metrics.getDashboard(),
+    approvalQueueDepth: approvalQueue.size()
+  });
+});
+
 router.get('/admin/status', adminAuth, async (req, res) => {
   let listingApp = null;
   try { listingApp = await la.checkHealth(); } catch (err) { listingApp = { ok: false, reason: err.message }; }
@@ -117,37 +135,20 @@ router.get('/admin/status', adminAuth, async (req, res) => {
 
 // Distil the persisted error envelope (issues_json / amazon_response_json) into
 // a compact, UI-friendly list of diagnostics so operators can see *why* a
-// submission failed without expanding the row. Returns [] when there is nothing
-// useful to show. The raw blobs are intentionally NOT shipped to the queue list.
-function summarizeErrorDetails({ issues_json, amazon_response_json }) {
-  const out = [];
-  let issues = null;
-  try { issues = issues_json ? JSON.parse(issues_json) : null; } catch (_) { issues = null; }
-  if (Array.isArray(issues)) {
-    for (const i of issues) {
-      if (!i) continue;
-      out.push({
-        code: i.code || null,
-        message: i.message || (typeof i === 'string' ? i : null),
-        severity: i.severity || null,
-        attributeNames: Array.isArray(i.attributeNames) ? i.attributeNames : (i.attributeName ? [i.attributeName] : [])
-      });
-    }
-  }
-  if (!out.length && amazon_response_json) {
-    let amazon = null;
-    try { amazon = JSON.parse(amazon_response_json); } catch (_) { amazon = null; }
-    if (amazon && typeof amazon === 'object' && amazon.error) {
-      const msg = typeof amazon.error === 'string' ? amazon.error : JSON.stringify(amazon.error);
-      out.push({ code: null, message: String(msg).slice(0, 2000), severity: 'ERROR', attributeNames: [] });
-    }
-  }
-  return out;
-}
+// submission failed without expanding the row. Shared with the Errors tab /
+// Excel export via src/errorReport.
+const summarizeErrorDetails = errorReport.summarizeErrorDetails;
 
+// Recent submissions for the console. Supports keyset pagination so the UI can
+// load the full history in batches: pass `beforeId` (the `nextBeforeId` from the
+// previous response) to fetch the next, older page. `total` lets the client know
+// when it has everything. The internal autoincrement `id` is used only as the
+// pagination cursor and is stripped from the per-row payload.
 router.get('/admin/queue', adminAuth, (req, res) => {
-  const rows = submissions.listRecent({ limit: req.query.limit || 200 }).map((r) => {
-    const { flyapp_meta_json, issues_json, amazon_response_json, ...rest } = r;
+  const beforeId = req.query.beforeId != null && req.query.beforeId !== '' ? Number(req.query.beforeId) : null;
+  const raw = submissions.listRecent({ limit: req.query.limit || 200, beforeId });
+  const rows = raw.map((r) => {
+    const { id, flyapp_meta_json, issues_json, amazon_response_json, ...rest } = r;
     let meta = null;
     if (flyapp_meta_json) {
       try { meta = JSON.parse(flyapp_meta_json); } catch (_) { meta = null; }
@@ -155,7 +156,8 @@ router.get('/admin/queue', adminAuth, (req, res) => {
     const errorDetails = summarizeErrorDetails({ issues_json, amazon_response_json });
     return { ...rest, meta, errorDetails };
   });
-  res.json({ submissions: rows });
+  const nextBeforeId = raw.length ? raw[raw.length - 1].id : null;
+  res.json({ submissions: rows, total: submissions.count(), nextBeforeId });
 });
 
 // Per-field change details for one submission: flyapp source value -> submitted
@@ -191,11 +193,7 @@ function approveOne(submission, actor, { via = 'console' } = {}) {
     status: 'IN_PROGRESS', approved_by: actor, approved_at: new Date().toISOString()
   });
   audit.record({ event: 'approved', submissionUuid: approved.submission_uuid, actor, details: { via } });
-  setImmediate(() => {
-    forwarder.forward(approved)
-      .then(() => recomputeJobStatus(approved.job_uuid))
-      .catch((err) => console.error(`[admin] forward after approval failed for ${approved.submission_uuid}:`, err.message));
-  });
+  approvalQueue.enqueue(approved);
   return approved;
 }
 
@@ -250,6 +248,26 @@ function resolveUuidBatch(body) {
   return out;
 }
 
+function resolveJobBatch(body) {
+  const jobIds = Array.isArray(body && body.jobIds) ? body.jobIds.slice(0, 100) : [];
+  const out = [];
+  const seen = new Set();
+  for (const id of jobIds) {
+    const jobId = String(id || '').trim();
+    if (!jobId || seen.has(jobId)) continue;
+    seen.add(jobId);
+    const job = jobs.getByUuid(jobId);
+    if (job) out.push(job);
+  }
+  return out;
+}
+
+function approvePendingRows(rows, actor, via) {
+  const pending = rows.filter((s) => s.status === 'PENDING_APPROVAL');
+  pending.forEach((s) => approveOne(s, actor, { via }));
+  return { pending, skipped: rows.length - pending.length };
+}
+
 // Group ("total submission") approval: approve every PENDING_APPROVAL row in the
 // posted set in one click. Non-pending rows are left untouched and reported as
 // skipped. One group audit event is recorded alongside the per-submission events.
@@ -258,12 +276,44 @@ router.post('/admin/group/approve', adminAuth, express.json(), async (req, res, 
     const rows = resolveUuidBatch(req.body);
     if (!rows.length) return res.status(400).json({ error: 'no_submissions' });
     const actor = operatorName(req);
-    const pending = rows.filter((s) => s.status === 'PENDING_APPROVAL');
-    pending.forEach((s) => approveOne(s, actor, { via: 'console_group' }));
+    const { pending, skipped } = approvePendingRows(rows, actor, 'console_group');
     if (pending.length) {
       audit.record({ event: 'approved_group', actor, details: { via: 'console', count: pending.length, submissionUuids: pending.map((s) => s.submission_uuid) } });
     }
-    res.json({ ok: true, approved: pending.length, skipped: rows.length - pending.length });
+    res.json({ ok: true, approved: pending.length, skipped, queued: approvalQueue.size() });
+  } catch (err) { next(err); }
+});
+
+// Job approval: approve every pending submission belonging to the selected jobs.
+// The actual SP-API writes are queued one-at-a-time by approvalQueue.
+router.post('/admin/jobs/approve', adminAuth, express.json(), async (req, res, next) => {
+  try {
+    const selectedJobs = resolveJobBatch(req.body);
+    if (!selectedJobs.length) return res.status(400).json({ error: 'no_jobs' });
+    const actor = operatorName(req);
+    const rows = [];
+    for (const job of selectedJobs) rows.push(...submissions.listForJob(job.job_uuid));
+    const uniqueRows = [];
+    const seen = new Set();
+    for (const row of rows) {
+      if (seen.has(row.submission_uuid)) continue;
+      seen.add(row.submission_uuid);
+      uniqueRows.push(row);
+    }
+    const { pending, skipped } = approvePendingRows(uniqueRows, actor, 'console_jobs');
+    if (pending.length) {
+      audit.record({
+        event: 'approved_jobs',
+        actor,
+        details: {
+          via: 'console',
+          jobUuids: selectedJobs.map((j) => j.job_uuid),
+          count: pending.length,
+          submissionUuids: pending.map((s) => s.submission_uuid)
+        }
+      });
+    }
+    res.json({ ok: true, jobs: selectedJobs.length, approved: pending.length, skipped, queued: approvalQueue.size() });
   } catch (err) { next(err); }
 });
 
@@ -304,6 +354,7 @@ router.post('/admin/group/changes', adminAuth, express.json(), async (req, res, 
         marketplace_code: s.marketplace_code,
         status: s.status,
         meta,
+        approver_comment: s.approver_comment || null,
         changes: review.changes,
         warnings: review.warnings,
         applied: review.applied
@@ -317,8 +368,185 @@ router.get('/admin/jobs', adminAuth, (req, res) => {
   res.json({ jobs: jobs.list({ limit: req.query.limit || 100 }).map((j) => ({
     jobId: j.job_uuid, kind: j.kind, caller: j.caller, asin: j.asin, marketplaceCode: j.marketplace_code,
     status: j.status, okCount: j.ok_count, failedCount: j.failed_count, targetCount: j.target_count,
+    pendingApprovalCount: submissions.listForJob(j.job_uuid).filter((s) => s.status === 'PENDING_APPROVAL').length,
     label: j.label, createdAt: j.created_at, completedAt: j.completed_at
   })) });
+});
+
+// Every submission carrying an Amazon error/diagnostic, distilled for the
+// Errors tab. Each record exposes the full issue list (code/message/severity/
+// attributeNames) plus the raw envelope for the expandable detail panel.
+router.get('/admin/errors', adminAuth, (req, res) => {
+  const records = errorReport.listErrorSubmissions({ limit: req.query.limit || 1000 }).map(errorReport.toRecord);
+  // Attach any existing AI-resolution state so the Errors tab can render a
+  // per-row badge ("AI: proposed / applied / rejected") in a single query.
+  const resState = aiResolutions.statusMap(records.map((r) => r.submission_uuid));
+  for (const r of records) {
+    const rs = resState[r.submission_uuid];
+    r.aiResolution = rs ? { status: rs.status, confidence: rs.confidence, resolvable: rs.resolvable, appliedSubmissionUuid: rs.appliedSubmissionUuid } : null;
+  }
+  res.json({ count: records.length, errors: records, resolverEnabled: aiResolver.isEnabled() });
+});
+
+// Excel (.xlsx) export of all error submissions — one row per Amazon issue so
+// every code/message lands on its own line. Served as a file download; the
+// console passes the operator JWT via ?token= since <a> downloads can't set an
+// Authorization header.
+router.get('/admin/errors/export', adminAuth, async (req, res, next) => {
+  try {
+    const { workbook } = await errorReport.buildWorkbook({ limit: req.query.limit || 5000 });
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.set('Content-Disposition', `attachment; filename="amazon-push-errors-${stamp}.xlsx"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) { next(err); }
+});
+
+// ── AI error resolution ─────────────────────────────────────────────────────
+// An OpenAI model reviews a FAILED submission, diagnoses the Amazon error, and
+// drafts a corrected SP-API package. Nothing reaches Amazon until an operator
+// approves the proposal here (POST .../apply), which forwards it as a NEW
+// audited submission linked back to the original via resolves_uuid.
+
+// Map the resolver's structured result to an HTTP response, distinguishing the
+// "feature off" / "not found" / "model failed" cases for the UI.
+function sendResolutionResult(res, result) {
+  if (!result) return res.status(500).json({ error: 'resolver_error' });
+  if (result.reason === 'resolver_disabled') return res.status(503).json({ error: 'resolver_disabled', message: 'OPENAI_API_KEY is not configured (AI resolver is off).' });
+  if (result.reason === 'submission_not_found') return res.status(404).json({ error: 'submission_not_found' });
+  if (result.reason === 'llm_failed') return res.status(502).json({ error: 'llm_failed', message: result.error || 'model call failed', resolution: result.resolution || null });
+  return res.json({ ok: true, cached: !!result.cached, resolution: result.resolution });
+}
+
+// Run (or re-run with ?force=1) the AI review for one failed submission.
+router.post('/admin/errors/:uuid/review', adminAuth, async (req, res, next) => {
+  try {
+    if (!aiResolver.isEnabled()) return res.status(503).json({ error: 'resolver_disabled', message: 'OPENAI_API_KEY is not configured (AI resolver is off).' });
+    const force = req.query.force === '1' || req.query.force === 'true';
+    const actor = operatorName(req);
+    const result = await aiResolver.reviewSubmission(req.params.uuid, { force, reviewedBy: actor });
+    if (result.ok && !result.cached) {
+      audit.record({ event: 'ai_review', submissionUuid: req.params.uuid, actor, details: { confidence: result.resolution && result.resolution.confidence, resolvable: result.resolution && result.resolution.resolvable, model: result.resolution && result.resolution.model, force } });
+    }
+    sendResolutionResult(res, result);
+  } catch (err) { next(err); }
+});
+
+// Fetch the cached AI resolution for one submission (no model call).
+router.get('/admin/errors/:uuid/review', adminAuth, (req, res) => {
+  const row = aiResolutions.getBySubmission(req.params.uuid);
+  if (!row) return res.status(404).json({ error: 'no_resolution' });
+  res.json({ ok: true, resolution: aiResolutions.toRecord(row) });
+});
+
+// Bounded fan-out: review every currently-FAILED submission that has no
+// resolution yet (sequentially, to respect OpenAI rate limits).
+router.post('/admin/errors/review-batch', adminAuth, express.json(), async (req, res, next) => {
+  try {
+    if (!aiResolver.isEnabled()) return res.status(503).json({ error: 'resolver_disabled', message: 'OPENAI_API_KEY is not configured (AI resolver is off).' });
+    const cap = Math.max(1, Math.min(50, Number(req.body && req.body.limit) || 25));
+    const force = !!(req.body && req.body.force);
+    const actor = operatorName(req);
+    const failed = submissions.listErrors({ limit: 1000 }).filter((r) => r.status === 'FAILED');
+    let reviewed = 0; let skipped = 0; let failedCount = 0;
+    for (const row of failed) {
+      if (reviewed >= cap) break;
+      if (!force && aiResolutions.getBySubmission(row.submission_uuid)) { skipped++; continue; }
+      const result = await aiResolver.reviewSubmission(row.submission_uuid, { force, reviewedBy: actor });
+      if (result.ok && !result.cached) {
+        reviewed++;
+        audit.record({ event: 'ai_review', submissionUuid: row.submission_uuid, actor, details: { batch: true, confidence: result.resolution && result.resolution.confidence, resolvable: result.resolution && result.resolution.resolvable } });
+      } else if (result.cached) {
+        skipped++;
+      } else {
+        failedCount++;
+      }
+    }
+    res.json({ ok: true, reviewed, skipped, failed: failedCount, totalFailed: failed.length });
+  } catch (err) { next(err); }
+});
+
+// Reject a proposal: discard it, never sent to Amazon.
+router.post('/admin/errors/:uuid/reject', adminAuth, express.json(), (req, res) => {
+  const existing = aiResolutions.getBySubmission(req.params.uuid);
+  if (!existing) return res.status(404).json({ error: 'no_resolution' });
+  const actor = operatorName(req);
+  const updated = aiResolutions.setStatus(req.params.uuid, { status: 'REJECTED', reviewedBy: actor });
+  audit.record({ event: 'ai_fix_rejected', submissionUuid: req.params.uuid, actor, details: { via: 'console' } });
+  res.json({ ok: true, resolution: aiResolutions.toRecord(updated) });
+});
+
+// Operator approval: take the (optionally edited) proposed package, re-validate
+// it, create a NEW submission linked to the original failure, and forward it to
+// Amazon immediately (the console approval is the human gate). Gated by the
+// master kill switch like every other write path.
+router.post('/admin/errors/:uuid/apply', adminAuth, writeGate, express.json(), async (req, res, next) => {
+  try {
+    const original = submissions.getByUuid(req.params.uuid);
+    if (!original) return res.status(404).json({ error: 'submission_not_found' });
+
+    const stored = aiResolutions.getBySubmission(req.params.uuid);
+    const storedRec = stored ? aiResolutions.toRecord(stored) : null;
+
+    // The package + operation come from the request body when the operator
+    // edited the proposal, else from the stored resolution.
+    const body = req.body || {};
+    const operation = (body.operation === 'patchItem' || body.operation === 'submitJsonListingsFeed')
+      ? body.operation
+      : (storedRec && storedRec.operation) || original.operation;
+    const pkg = body.package || (storedRec && storedRec.proposedPackage) || null;
+    if (!pkg || typeof pkg !== 'object') {
+      return res.status(400).json({ error: 'no_package', message: 'No proposed package to apply. Run a review first, or supply a package in the request body.' });
+    }
+
+    const marketplaceCode = String(original.marketplace_code || '').toUpperCase();
+    if (!resolveByCode(marketplaceCode)) return res.status(400).json({ error: 'unknown_marketplace', message: `Unknown marketplace: ${original.marketplace_code}` });
+    const productType = original.product_type;
+    if (!productType) return res.status(400).json({ error: 'missing_product_type' });
+
+    const validated = await packageValidator.validatePackage({
+      pkg, operation, productType, marketplaceCode, allowUnknownAttributes: false
+    });
+    if (!validated.ok) {
+      return res.status(400).json({ error: 'package_invalid', problems: validated.problems, droppedAttrNames: validated.droppedAttrNames || [] });
+    }
+
+    const actor = operatorName(req);
+    const requestBody = buildRequestBody({ operation, marketplaceCode, productType, validated });
+
+    // Parent job so the fix is visible in the Jobs tab and status recomputes.
+    const jobUuid = newUuid();
+    jobs.create({
+      jobUuid, kind: 'ai_fix', caller: actor, asin: original.asin, itemNumber: original.item_number,
+      marketplaceCode, productType, label: `AI fix of ${original.submission_uuid}`, targetCount: 1
+    });
+    jobs.update(jobUuid, { status: 'running', started_at: new Date().toISOString() });
+
+    const submissionUuid = newUuid();
+    const submission = submissions.insert({
+      submissionUuid, jobUuid, caller: actor, scope: original.scope, operation,
+      vendorCode: original.vendor_code, sku: original.effective_sku || original.sku, parentSku: original.parent_sku,
+      asin: original.asin, itemNumber: original.item_number, marketplaceCode, productType,
+      requestBody, status: 'IN_PROGRESS', payloadOrigin: 'ai_resolved', rawPackage: pkg,
+      flyappMeta: { resolvesUuid: original.submission_uuid, aiModel: storedRec && storedRec.model, aiConfidence: storedRec && storedRec.confidence },
+      resolvesUuid: original.submission_uuid, approverComment: body.comment || null
+    });
+    audit.record({ event: 'ai_fix_applied', submissionUuid, jobUuid, actor, details: { resolvesUuid: original.submission_uuid, operation, changedAttrNames: validated.changedAttrNames, edited: !!body.package } });
+
+    const finalRow = await forwarder.forward(submission);
+    recomputeJobStatus(jobUuid);
+    aiResolutions.setStatus(req.params.uuid, { status: 'APPLIED', reviewedBy: actor, appliedSubmissionUuid: submissionUuid });
+
+    res.status(202).json({
+      ok: true,
+      submissionId: submissionUuid,
+      jobId: jobUuid,
+      status: finalRow.status,
+      issues: forwarder.buildResponseFromSubmission(finalRow).issues,
+      errorMessage: finalRow.error_message || null
+    });
+  } catch (err) { next(err); }
 });
 
 // Recent over-time reconciliation checks (read-only, for the console).

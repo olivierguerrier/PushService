@@ -26,7 +26,8 @@ async function patchItem({ sellerId, sku, marketplaceCode, productType, patches,
     body: { productType, patches },
     query,
     contentType: 'application/json',
-    marketplaceCode
+    marketplaceCode,
+    rateLimitKey: 'patchListingsItem'
   });
 }
 
@@ -35,7 +36,8 @@ async function getItem({ sellerId, sku, marketplaceCode, includedData = ['summar
   const marketplaceId = amazonMarketplaceId(marketplaceCode);
   return client.request('GET', region, pathFor({ sellerId, sku }), {
     query: { marketplaceIds: marketplaceId, includedData: includedData.join(',') },
-    marketplaceCode
+    marketplaceCode,
+    rateLimitKey: 'getListingsItem'
   });
 }
 

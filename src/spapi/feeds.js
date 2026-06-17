@@ -8,7 +8,7 @@ const DOCS_BASE = '/feeds/2021-06-30/documents';
 
 async function createFeedDocument({ marketplaceCode, contentType = 'application/json' }) {
   const region = regionFor(marketplaceCode);
-  return client.request('POST', region, DOCS_BASE, { body: { contentType }, contentType: 'application/json', marketplaceCode });
+  return client.request('POST', region, DOCS_BASE, { body: { contentType }, contentType: 'application/json', marketplaceCode, rateLimitKey: 'createFeedDocument' });
 }
 
 async function uploadFeedDocument({ url, body, contentType }) {
@@ -32,17 +32,17 @@ async function createFeed({ marketplaceCode, feedType = 'JSON_LISTINGS_FEED', fe
   const marketplaceId = amazonMarketplaceId(marketplaceCode);
   const body = { feedType, marketplaceIds: [marketplaceId], inputFeedDocumentId: feedDocumentId };
   if (options) body.feedOptions = options;
-  return client.request('POST', region, FEEDS_BASE, { body, contentType: 'application/json', marketplaceCode });
+  return client.request('POST', region, FEEDS_BASE, { body, contentType: 'application/json', marketplaceCode, rateLimitKey: 'createFeed' });
 }
 
 async function getFeed({ feedId, marketplaceCode }) {
   const region = regionFor(marketplaceCode);
-  return client.request('GET', region, `${FEEDS_BASE}/${encodeURIComponent(feedId)}`, { marketplaceCode });
+  return client.request('GET', region, `${FEEDS_BASE}/${encodeURIComponent(feedId)}`, { marketplaceCode, rateLimitKey: 'getFeed' });
 }
 
 async function getFeedDocument({ feedDocumentId, marketplaceCode }) {
   const region = regionFor(marketplaceCode);
-  return client.request('GET', region, `${DOCS_BASE}/${encodeURIComponent(feedDocumentId)}`, { marketplaceCode });
+  return client.request('GET', region, `${DOCS_BASE}/${encodeURIComponent(feedDocumentId)}`, { marketplaceCode, rateLimitKey: 'getFeedDocument' });
 }
 
 async function downloadFeedResult({ feedDocumentId, marketplaceCode }) {

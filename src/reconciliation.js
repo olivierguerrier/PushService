@@ -30,18 +30,29 @@ function expectedFromSubmission(submission) {
   let body = null;
   try { body = submission.request_body_json ? JSON.parse(submission.request_body_json) : null; } catch { body = null; }
   if (!body) return {};
+  let expected;
   if (submission.operation === 'submitJsonListingsFeed') {
-    const { expected } = packageValidator.extractExpected({ pkg: body.payload, operation: 'submitJsonListingsFeed' });
-    return expected;
+    ({ expected } = packageValidator.extractExpected({ pkg: body.payload, operation: 'submitJsonListingsFeed' }));
+  } else {
+    ({ expected } = packageValidator.extractExpected({ pkg: { patches: body.patches || [] }, operation: 'patchItem' }));
   }
-  const { expected } = packageValidator.extractExpected({ pkg: { patches: body.patches || [] }, operation: 'patchItem' });
+  // package_level is deferred at forward-time, so request_body_json still
+  // carries it even though the initial write omitted it. Only expect it on
+  // Amazon when it was actually re-added and sent.
+  if (Number(submission.package_level_readded) !== 1 && expected && 'package_level' in expected) {
+    const { package_level, ...rest } = expected;
+    return rest;
+  }
   return expected;
 }
 
 // Schedule reconciliation checks for an APPLIED submission. Idempotent-ish:
 // callers should only invoke once per submission (on the APPLIED transition).
 function enqueueForSubmission(submission, { offsets = parseOffsets(env.RECON_OFFSETS), now = Date.now() } = {}) {
-  if (!submission || !submission.sku || !submission.vendor_code) return { scheduled: 0, reason: 'missing sku/vendor_code' };
+  // Read back the listing we actually wrote: the vendor_sku fallback may have
+  // pushed to the parent SKU (effective_sku) rather than the documented one.
+  const effectiveSku = (submission && (submission.effective_sku || submission.sku)) || null;
+  if (!submission || !effectiveSku || !submission.vendor_code) return { scheduled: 0, reason: 'missing sku/vendor_code' };
   const expected = expectedFromSubmission(submission);
   if (!Object.keys(expected).length) return { scheduled: 0, reason: 'no expected attributes' };
 
@@ -65,7 +76,7 @@ function enqueueForSubmission(submission, { offsets = parseOffsets(env.RECON_OFF
         job_uuid: submission.job_uuid,
         attempt_index: idx,
         vendor_code: submission.vendor_code,
-        sku: submission.sku,
+        sku: effectiveSku,
         asin: submission.asin,
         marketplace_code: submission.marketplace_code,
         product_type: submission.product_type,

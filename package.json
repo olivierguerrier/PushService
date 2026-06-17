@@ -14,6 +14,7 @@
     "dev": "nodemon server.js",
     "init-db": "node scripts/init-db.js",
     "replay-audit": "node scripts/replay-audit-log.js",
+    "repush-101168": "node scripts/repush-101168.js",
     "smoke": "node scripts/smoke-spapi.js",
     "test": "node --test"
   },
@@ -21,12 +22,14 @@
     "better-sqlite3": "^12.6.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "node-cron": "^4.0.0",
     "nodemailer": "^6.9.14",
+    "openai": "^4.104.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

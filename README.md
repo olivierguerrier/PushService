@@ -106,6 +106,16 @@ time only because Amazon's Listings Items API addresses listings by
 `{sellerId}/{sku}` — it is the technical execution key, not the identifier the
 system is organised around.
 
+`parentSku` (optional) is the **vendor SKU fallback**. Some listings are
+registered under a parent vendor code's SKU even though the target vendor code's
+documented SKU (from SP-API / the vendor xlsx) is different — often equal to the
+ASIN. When Amazon rejects the documented SKU with error `101168` ("You can't
+change Vendor SKU from its original value '<sku>'" on `vendor_sku`), the
+forwarder automatically retries the **same vendor code** using this caller-
+supplied `parentSku`. The parent SKU is sourced from the caller (FlyApp), never
+inferred from Amazon's response. The SKU that actually succeeded is recorded as
+`effectiveSku` and is what reconciliation read-backs and reverts target.
+
 ```json
 {
   "scope": "PRICING",
@@ -144,6 +154,7 @@ reconciliation still work.
       "asin": "B0XXXXXXX",
       "sellerId": "VENDORCODE",
       "sku": "VENDOR-SKU",
+      "parentSku": "PARENT-VENDOR-SKU",
       "marketplaceCode": "US",
       "productType": "TOYS_AND_GAMES",
       "package": {
@@ -160,6 +171,38 @@ reconciliation still work.
 For `operation: "submitJsonListingsFeed"` the package carries `{ messages: [...] }`
 (JSON_LISTINGS_FEED) instead of `patches`. Both paths keep FlyApp segregated:
 it talks to this service over HTTP only — never its database.
+
+### Forward-time resilience (patchItem)
+
+The forwarder hardens live `patchItem` writes against two well-known Amazon
+failure modes:
+
+- **Transient internal error (`4000000`)** — Amazon's generic "an internal
+  error has occurred, try again". The same patch is re-submitted up to
+  `SPAPI_INTERNAL_RETRY_MAX` times (default 2) with the
+  `SPAPI_INTERNAL_RETRY_BACKOFF_MS` backoff before settling `FAILED`.
+- **Vendor SKU rejection (`101168`)** — "you can't change Vendor SKU from its
+  original value". The forwarder retries the **same vendor code** through tiered
+  fallbacks, recording the winning `effectiveSku`:
+  1. the caller-supplied `parentSku` (see above — authoritative);
+  2. if that is absent or *also* rejected with `101168`, the canonical SKU
+     Amazon names in the rejection message, parsed out as a last resort
+     (EN/DE locales). Each candidate is tried once, so it never loops.
+- **Already-listed no-op (`101161` / `101165`)** — once addressed by the correct
+  SKU, Amazon may reject a content match because the SKU↔ASIN association already
+  exists ("matches another product … SKUs cannot be duplicated" / "identifiers
+  aren't unique"). The desired state already holds, so the forwarder settles the
+  submission as **`APPLIED` (a successful no-op)** rather than `FAILED`, keeping
+  the issues on the row for audit and emitting a `noop_already_listed` event.
+
+These are scoped narrowly (only their specific issue codes) so genuine
+validation errors are never silently retried, and they compose: a `4000000`
+on either the documented-SKU or parent-SKU attempt is retried in place.
+
+To re-settle historical rows that failed before this logic existed, run
+`npm run repush-101168` (dry-run) then `npm run repush-101168 -- --apply`. It
+re-pushes each `FAILED` `101168` patch through the forwarder so the tiered
+fallback (and the no-op resolution) applies. Honours the kill switch.
 
 ## Over-time reconciliation
 

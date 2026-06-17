@@ -89,21 +89,52 @@ function list({ status = null, kind = null, asin = null, marketplaceCode = null,
   return db.prepare(`SELECT * FROM push_jobs ${where} ORDER BY created_at DESC, id DESC LIMIT ${cap}`).all(...params).map(hydrate);
 }
 
-// Roll forward any pending/running job older than staleAfterMinutes — a
-// crash mid-fan-out would otherwise pin the row "in flight" forever.
+// Close only legacy jobs whose fan-out was interrupted before every target
+// received a submission row AND whose stored request no longer has the target
+// list needed to resume. Jobs with a full set of child rows stay open — boot
+// recovery re-forwards any IN_PROGRESS children and recomputes the parent rollup.
 function recoverStuckJobs({ staleAfterMinutes = 15 } = {}) {
+  const { recomputeJobStatus } = require('./jobOrchestrator');
+  const { hasResumableTargets } = require('./jobFanOutResume');
   const db = getDb();
   const cutoffIso = new Date(Date.now() - staleAfterMinutes * 60 * 1000).toISOString();
   const stuck = db.prepare(`
-    SELECT job_uuid, status, ok_count, failed_count, target_count, started_at, created_at
-    FROM push_jobs
-    WHERE status IN ('pending', 'running') AND COALESCE(started_at, created_at) < ?
+    SELECT j.job_uuid, j.status, j.ok_count, j.failed_count, j.target_count, j.started_at, j.created_at,
+           j.request_payload_json,
+           (SELECT COUNT(*) FROM push_submissions s WHERE s.job_uuid = j.job_uuid) AS submission_count
+    FROM push_jobs j
+    WHERE j.status IN ('pending', 'running') AND COALESCE(j.started_at, j.created_at) < ?
   `).all(cutoffIso);
-  const summary = { scanned: stuck.length, recovered: 0 };
+  const summary = { scanned: stuck.length, recovered: 0, recomputed: 0, leftOpen: 0 };
   for (const row of stuck) {
-    const ok = Number(row.ok_count) || 0;
-    const failed = Number(row.failed_count) || 0;
+    const submissionCount = Number(row.submission_count) || 0;
     const target = Number(row.target_count) || 0;
+    if (submissionCount >= target) {
+      try {
+        recomputeJobStatus(row.job_uuid);
+        summary.recomputed += 1;
+      } catch (err) {
+        console.warn(`[jobs] failed to recompute job ${row.job_uuid}: ${err.message}`);
+      }
+      continue;
+    }
+    if (hasResumableTargets(row.request_payload_json)) {
+      try {
+        recomputeJobStatus(row.job_uuid);
+        summary.leftOpen += 1;
+      } catch (err) {
+        console.warn(`[jobs] failed to recompute resumable job ${row.job_uuid}: ${err.message}`);
+      }
+      continue;
+    }
+    const counts = db.prepare(`
+      SELECT
+        SUM(CASE WHEN status = 'APPLIED' THEN 1 ELSE 0 END) AS ok,
+        SUM(CASE WHEN status IN ('FAILED', 'REJECTED', 'EXPIRED', 'BLOCKED') THEN 1 ELSE 0 END) AS failed
+      FROM push_submissions WHERE job_uuid = ?
+    `).get(row.job_uuid);
+    const ok = Number(counts && counts.ok) || 0;
+    const failed = Number(counts && counts.failed) || 0;
     const newStatus = ok > 0 ? 'partial' : 'failed';
     const remaining = Math.max(0, target - ok - failed);
     try {
@@ -111,9 +142,9 @@ function recoverStuckJobs({ staleAfterMinutes = 15 } = {}) {
         status: newStatus,
         failed_count: failed + remaining,
         completed_at: new Date().toISOString(),
-        error_message: `Recovered at boot: process died mid-job (was '${row.status}').`
+        error_message: `Recovered at boot: process died mid-fan-out (was '${row.status}', ${submissionCount}/${target} targets).`
       });
-      audit.record({ event: 'job_recovered_at_boot', jobUuid: row.job_uuid, actor: 'system', details: { previous_status: row.status, new_status: newStatus } });
+      audit.record({ event: 'job_recovered_at_boot', jobUuid: row.job_uuid, actor: 'system', details: { previous_status: row.status, new_status: newStatus, submission_count: submissionCount, target_count: target } });
       summary.recovered += 1;
     } catch (err) {
       console.warn(`[jobs] failed to recover stuck job ${row.job_uuid}: ${err.message}`);

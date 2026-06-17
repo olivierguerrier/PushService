@@ -13,7 +13,7 @@
 <title>Amazon Push Service — console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link rel="stylesheet" href="/styles.css?v=20260616-1" />
+<link rel="stylesheet" href="/styles.css?v=20260617-3" />
 </head>
 <body>
   <aside id="sidebar" class="sidebar">
@@ -41,6 +41,10 @@
       <button class="sidebar-item" data-tab="audit">
         <span class="sidebar-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/><path d="M9 15l2 2 4-4"/></svg></span>
         <span>Audit</span>
+      </button>
+      <button class="sidebar-item" data-tab="errors">
+        <span class="sidebar-icon"><svg viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span>
+        <span>Errors</span>
       </button>
     </nav>
 
@@ -78,6 +82,23 @@
   </header>
 
   <main>
+    <section class="panel" id="metricsPanel">
+      <h2>Dashboard</h2>
+      <div id="metricsGrid" class="kpi-row">Loading…</div>
+      <div id="metricsProgress" class="metrics-progress hidden" aria-hidden="true">
+        <div class="metrics-progress-label">
+          <div>
+            <span id="metricsProgressText">—</span>
+            <div id="metricsProgressDetail" class="metrics-progress-detail"></div>
+          </div>
+          <span id="metricsProgressPct">—</span>
+        </div>
+        <div class="metrics-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+          <div id="metricsProgressBar" class="metrics-progress-bar"></div>
+        </div>
+      </div>
+    </section>
+
     <section class="panel" id="statusPanel">
       <h2>Status</h2>
       <div id="statusGrid" class="kpi-row">Not connected.</div>
@@ -89,6 +110,7 @@
         <button id="selectAllQueue" class="bulk-approve" type="button" disabled>Select all visible</button>
         <button id="clearQueueSelection" class="bulk-approve" type="button" disabled>Unselect</button>
         <button id="approveSelectedQueue" class="bulk-approve" type="button" disabled>Approve selected</button>
+        <button id="rejectSelectedQueue" class="bulk-approve bulk-reject" type="button" disabled>Reject selected</button>
         <span id="queueBulkStatus" class="bulk-status"></span>
         <button class="refresh" data-refresh="queue">Refresh</button>
         <div class="col-selector-wrapper" id="queueColSelectorWrapper">
@@ -164,12 +186,49 @@
         <th>At</th><th>Event</th><th>Actor</th><th>Submission</th><th>Details</th><th>Hash</th>
       </tr></thead><tbody></tbody></table></div>
     </section>
+
+    <section class="panel tabview hidden" id="tab-errors">
+      <div class="toolbar">
+        <h2>Amazon errors</h2>
+        <span id="errorsCount" class="bulk-status"></span>
+        <button id="reviewAllErrors" class="bulk-approve" type="button" hidden>Review all (AI)</button>
+        <span id="errorsReviewStatus" class="bulk-status"></span>
+        <button class="refresh" data-refresh="errors">Refresh</button>
+        <a id="errorsExportLink" class="export-btn" href="#">Export Excel</a>
+      </div>
+      <div class="tablewrap"><table id="errorsTable"><thead><tr>
+        <th>Created</th><th>Status</th><th>ASIN</th><th>SKU</th><th>Mkt</th>
+        <th>Codes</th><th>Message</th><th>Details</th><th>AI fix</th>
+      </tr></thead><tbody></tbody></table></div>
+    </section>
   </main>
   </div>
 
   <div class="col-selector-overlay" id="queueColSelectorOverlay"></div>
-  <script src="/col-filter.js?v=20260616-1"></script>
-  <script src="/column-ui.js?v=20260616-1"></script>
-  <script src="/app.js?v=20260616-1"></script>
+
+  <!-- AI error-resolution review modal -->
+  <div id="aiModalOverlay" class="ai-modal-overlay" hidden>
+    <div class="ai-modal" role="dialog" aria-modal="true" aria-labelledby="aiModalTitle">
+      <div class="ai-modal-header">
+        <div>
+          <h3 id="aiModalTitle">AI error review</h3>
+          <div class="ai-modal-subtitle" id="aiModalSubtitle"></div>
+        </div>
+        <button id="aiModalClose" class="ai-modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div id="aiModalBody" class="ai-modal-body"></div>
+      <div class="ai-modal-footer">
+        <button id="aiRerunBtn" class="btn-ghost" type="button" title="Discard and re-run the model">Re-run</button>
+        <span id="aiModalStatus" class="bulk-status"></span>
+        <span class="ai-modal-footer-spacer"></span>
+        <button id="aiRejectBtn" class="btn-ghost btn-ghost--danger" type="button">Reject</button>
+        <button id="aiApplyBtn" class="btn-primary" type="button">Approve &amp; push</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/col-filter.js?v=20260617-1"></script>
+  <script src="/column-ui.js?v=20260617-1"></script>
+  <script src="/app.js?v=20260617-3"></script>
 </body>
 </html>

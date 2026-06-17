@@ -51,6 +51,82 @@
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  function formatDuration(seconds) {
+    if (seconds == null || !Number.isFinite(seconds)) return '—';
+    if (seconds < 60) return '< 1 min';
+    const mins = Math.round(seconds / 60);
+    if (mins < 60) return `~${mins} min`;
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return m ? `~${h} h ${m} min` : `~${h} h`;
+  }
+
+  async function loadMetrics() {
+    try {
+      const m = await api('/admin/metrics');
+      const w = m.windowHours || 24;
+      const j24 = m.jobs24h || {};
+      const jobsInProgress = (j24.running || 0) + (j24.pending || 0);
+      const active = m.submissionsActive || 0;
+      const speed = m.throughput && m.throughput.perMinute != null ? m.throughput.perMinute : 0;
+      const windowMin = (m.throughput && m.throughput.windowMinutes) || 15;
+      const etaText = active === 0 && !(m.progress24h && m.progress24h.remaining)
+        ? 'Idle'
+        : m.eta && m.eta.available
+          ? formatDuration(m.eta.seconds)
+          : '—';
+      const etaTone = (active || (m.progress24h && m.progress24h.remaining)) && m.eta && m.eta.available ? 'warn' : '';
+      const finished = j24.finished || ((j24.completed || 0) + (j24.partial || 0) + (j24.failed || 0));
+      const cells = [
+        [`Jobs (${w}h)`, String(j24.total || 0), jobsInProgress ? 'warn' : (j24.total ? 'pos' : ''),
+          `${j24.running || 0} running · ${finished} finished`],
+        ['Active submissions', String(active), active ? 'warn' : '',
+          `${m.submissionsPendingApproval} awaiting approval · ${m.submissionsInFlight} in flight`],
+        ['Job speed', speed ? `${speed}/min` : '0/min', speed ? 'pos' : '',
+          `${(m.throughput && m.throughput.settled) || 0} settled in last ${windowMin} min`],
+        ['Est. completion', etaText, etaTone,
+          m.approvalQueueDepth ? `${m.approvalQueueDepth} queued for SP-API` : 'No queued writes']
+      ];
+      $('#metricsGrid').innerHTML = cells.map(([k, v, tone, detail]) =>
+        `<div class="kpi${tone ? ' kpi-' + tone : ''}">` +
+        `<div class="kpi-label">${esc(k)}</div>` +
+        `<div class="kpi-value">${esc(v)}</div>` +
+        (detail ? `<div class="kpi-detail">${esc(detail)}</div>` : '') +
+        `</div>`
+      ).join('');
+
+      const prog = m.progress24h || m.progress || {};
+      const showBar = (prog.total || 0) > 0;
+      const bar = $('#metricsProgress');
+      if (bar) {
+        bar.classList.toggle('hidden', !showBar);
+        bar.setAttribute('aria-hidden', showBar ? 'false' : 'true');
+        if (showBar) {
+          const pct = prog.percent || 0;
+          const ok = prog.ok || 0;
+          const failed = prog.failed || 0;
+          const remaining = prog.remaining || 0;
+          $('#metricsProgressText').textContent =
+            `${prog.done || 0} of ${prog.total || 0} submissions complete (last ${w}h)`;
+          $('#metricsProgressDetail').textContent =
+            `${ok} applied · ${failed} failed · ${remaining} remaining`;
+          $('#metricsProgressPct').textContent = `${pct}%`;
+          const fill = $('#metricsProgressBar');
+          if (fill) fill.style.width = `${pct}%`;
+          const track = bar.querySelector('.metrics-progress-track');
+          if (track) {
+            track.setAttribute('aria-valuenow', String(pct));
+            track.setAttribute('aria-valuetext', `${pct}% complete`);
+          }
+        }
+      }
+    } catch (e) {
+      if (e.message === '401') return;
+      const el = $('#metricsGrid');
+      if (el) el.textContent = 'Error: ' + e.message;
+    }
+  }
+
   async function loadStatus() {
     try {
       const s = await api('/admin/status');
@@ -131,11 +207,15 @@
   const LEGACY_QUEUE_COL_KEYS = QUEUE_COL_KEYS.filter((k) => k !== 'select');
 
   // ── Pagination ───────────────────────────────────────────────────────────
-  // The server returns up to QUEUE_FETCH_LIMIT rows in one shot; filtering and
-  // sorting run over that whole set client-side, and only the slice for the
-  // current page is rendered. This guarantees filters/sort affect every loaded
-  // record, not just the visible page.
+  // The console loads the FULL submission history (not just the most recent
+  // page) by fetching it from the server in batches via a keyset cursor.
+  // Filtering and sorting then run over that whole set client-side, and only the
+  // slice for the current page is rendered — so filters/sort affect every record
+  // and the operator can page back to the oldest submissions.
+  //   QUEUE_FETCH_LIMIT — rows per server request (the server caps this at 1000).
+  //   QUEUE_MAX_ROWS     — safety ceiling on how many rows we hold in the browser.
   const QUEUE_FETCH_LIMIT = 1000;
+  const QUEUE_MAX_ROWS = 25000;
   const QUEUE_PAGE_SIZES = [50, 100, 200, 500, 1000];
   const QUEUE_PAGE_STORAGE = 'aps_queue_page_size';
   const queuePageState = { page: 1, pageSize: 200, fetchCapped: false };
@@ -600,7 +680,7 @@
       const from = total ? start + 1 : 0;
       const to = start + shown;
       const capNote = queuePageState.fetchCapped
-        ? ` <span class="pagination-cap" title="Only the ${QUEUE_FETCH_LIMIT} most recent submissions are loaded.">(first ${QUEUE_FETCH_LIMIT} loaded)</span>`
+        ? ` <span class="pagination-cap" title="Showing the ${QUEUE_MAX_ROWS.toLocaleString()} most recent submissions; older ones are not loaded.">(most recent ${QUEUE_MAX_ROWS.toLocaleString()} loaded)</span>`
         : '';
       info.innerHTML = `Showing <strong>${from.toLocaleString()}–${to.toLocaleString()}</strong> of <strong>${total.toLocaleString()}</strong>${capNote}`;
     }
@@ -771,6 +851,7 @@
     const selectAllBtn = $('#selectAllQueue');
     const clearBtn = $('#clearQueueSelection');
     const approveBtn = $('#approveSelectedQueue');
+    const rejectBtn = $('#rejectSelectedQueue');
     const status = $('#queueBulkStatus');
 
     document.querySelectorAll('#queueTable tbody input.queue-select').forEach((cb) => {
@@ -794,6 +875,10 @@
     if (approveBtn) {
       approveBtn.disabled = queueBulkBusy || selectedCount === 0;
       approveBtn.textContent = selectedCount ? `Approve selected (${selectedCount})` : 'Approve selected';
+    }
+    if (rejectBtn) {
+      rejectBtn.disabled = queueBulkBusy || selectedCount === 0;
+      rejectBtn.textContent = selectedCount ? `Reject selected (${selectedCount})` : 'Reject selected';
     }
     if (status && !queueBulkBusy) {
       status.textContent = selectedCount ? `${selectedCount} submission${selectedCount === 1 ? '' : 's'} selected` : queueBulkMessage;
@@ -832,6 +917,34 @@
       queueBulkMessage = 'Approval failed: ' + err.message;
       if (status) status.textContent = queueBulkMessage;
       alert('Approve selected submissions failed: ' + err.message);
+    } finally {
+      queueBulkBusy = false;
+      syncQueueSelectionControls();
+    }
+  }
+
+  async function rejectSelectedQueue() {
+    if (queueBulkBusy) return;
+    pruneQueueSelection();
+    const uuids = [...selectedQueueUuids];
+    if (!uuids.length) return;
+    if (!confirm(`Reject ${uuids.length} selected pending submission(s)? They will NOT be sent to Amazon.`)) return;
+    const status = $('#queueBulkStatus');
+    queueBulkBusy = true;
+    syncQueueSelectionControls();
+    if (status) status.textContent = 'Rejecting submissions...';
+    try {
+      const result = await apiPost('/admin/group/reject', { uuids });
+      selectedQueueUuids.clear();
+      queueBulkMessage = `Rejected ${result.rejected || 0} submission${result.rejected === 1 ? '' : 's'}; skipped ${result.skipped || 0}.`;
+      if (status) status.textContent = queueBulkMessage;
+      await loadQueue();
+      loadJobs();
+    } catch (err) {
+      if (err.message === '401') return;
+      queueBulkMessage = 'Rejection failed: ' + err.message;
+      if (status) status.textContent = queueBulkMessage;
+      alert('Reject selected submissions failed: ' + err.message);
     } finally {
       queueBulkBusy = false;
       syncQueueSelectionControls();
@@ -951,8 +1064,24 @@
   async function loadQueue() {
     const tbody = $('#queueTable tbody');
     try {
-      const { submissions } = await api(`/admin/queue?limit=${QUEUE_FETCH_LIMIT}`);
-      queuePageState.fetchCapped = submissions.length >= QUEUE_FETCH_LIMIT;
+      // Pull the whole history in keyset batches (newest -> oldest) until the
+      // server has nothing older, or we hit the in-browser safety ceiling.
+      const submissions = [];
+      let beforeId = null;
+      let total = Infinity;
+      for (let guard = 0; submissions.length < QUEUE_MAX_ROWS && guard < 1000; guard++) {
+        const qs = beforeId == null
+          ? `?limit=${QUEUE_FETCH_LIMIT}`
+          : `?limit=${QUEUE_FETCH_LIMIT}&beforeId=${encodeURIComponent(beforeId)}`;
+        const data = await api('/admin/queue' + qs);
+        const batch = Array.isArray(data.submissions) ? data.submissions : [];
+        if (typeof data.total === 'number') total = data.total;
+        submissions.push(...batch);
+        if (!data.nextBeforeId || batch.length < QUEUE_FETCH_LIMIT) break;
+        beforeId = data.nextBeforeId;
+      }
+      // True only if more rows exist on the server than we loaded (ceiling hit).
+      queuePageState.fetchCapped = Number.isFinite(total) && submissions.length < total;
       changesCache.clear();
       groupSubs.clear();
       subsByUuid.clear();
@@ -1278,12 +1407,289 @@
   const emptyRow = (n) => `<tr><td colspan="${n}" style="text-align:center;color:var(--text-muted);padding:20px;">No rows.</td></tr>`;
   const errRow = (n, e) => `<tr><td colspan="${n}" style="text-align:center;color:var(--color-neg-text);padding:20px;">${e.message === '401' ? 'Unauthorized' : esc(e.message)}</td></tr>`;
 
-  const loaders = { queue: loadQueue, jobs: loadJobs, audit: loadAudit };
+  // Distinct Amazon issue codes for one error record, in first-seen order.
+  function errorCodes(rec) {
+    const codes = [];
+    (rec.errorDetails || []).forEach((d) => { if (d && d.code && !codes.includes(d.code)) codes.push(d.code); });
+    return codes.join(', ');
+  }
+
+  // Errors tab state for the AI resolver: the latest fetched error records
+  // (keyed by submission_uuid) and whether the resolver feature is enabled.
+  const errorsByUuid = new Map();
+  let resolverEnabled = false;
+
+  // Small pill summarising a submission's AI-resolution state, if any.
+  function aiBadge(rs) {
+    if (!rs || !rs.status) return '';
+    const tone = rs.status === 'APPLIED' ? 'ok' : rs.status === 'REJECTED' || rs.status === 'FAILED' ? 'bad' : 'warn';
+    const conf = (rs.confidence != null) ? ` ${rs.confidence}%` : '';
+    return `<span class="badge ${tone}" title="AI resolution: ${esc(rs.status)}">AI ${esc(rs.status)}${conf}</span>`;
+  }
+
+  function aiActionCell(r) {
+    if (!resolverEnabled) return '<span class="muted-cell">—</span>';
+    const rs = r.aiResolution;
+    const label = rs ? (rs.status === 'APPLIED' ? 'View fix' : 'Review fix') : 'Review &amp; fix (AI)';
+    const badge = aiBadge(rs);
+    return `<div class="ai-cell">
+      <button class="btn-ghost ai-review-btn" data-uuid="${esc(r.submission_uuid)}" title="Review this error with AI">${label}</button>
+      ${badge}
+    </div>`;
+  }
+
+  async function loadErrors() {
+    const tbody = $('#errorsTable tbody');
+    const link = $('#errorsExportLink');
+    if (link) link.href = `/admin/errors/export?token=${encodeURIComponent(token)}`;
+    try {
+      const resp = await api('/admin/errors');
+      const { count, errors } = resp;
+      resolverEnabled = !!resp.resolverEnabled;
+      const reviewAllBtn = $('#reviewAllErrors');
+      if (reviewAllBtn) reviewAllBtn.hidden = !resolverEnabled;
+      errorsByUuid.clear();
+      errors.forEach((r) => errorsByUuid.set(r.submission_uuid, r));
+      const countEl = $('#errorsCount');
+      if (countEl) countEl.textContent = count ? `${count} submission${count === 1 ? '' : 's'} with errors` : 'No errors';
+      if (link) link.classList.toggle('disabled', !count);
+      tbody.innerHTML = errors.map((r) => {
+        const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
+        const codes = errorCodes(r);
+        const msg = r.error_message || (details[0] ? formatErrorDetail(details[0]) : '');
+        const issueLines = details.map(formatErrorDetail).filter(Boolean).join('\n');
+        let raw = '';
+        if (r.rawResponse) {
+          try { raw = JSON.stringify(JSON.parse(r.rawResponse), null, 2); } catch (_) { raw = r.rawResponse; }
+        }
+        const detailText = [issueLines, raw ? '--- Raw Amazon response ---\n' + raw : ''].filter(Boolean).join('\n\n');
+        const detailCell = detailText ? `<details><summary>view</summary><pre>${esc(detailText)}</pre></details>` : '';
+        return `<tr data-uuid="${esc(r.submission_uuid)}">
+          <td>${esc(r.created_at || '')}</td>
+          <td>${statusBadge(r.status)}</td>
+          <td>${esc(r.asin || '')}</td>
+          <td>${esc(r.sku || '')}</td>
+          <td>${esc(r.marketplace_code || '')}</td>
+          <td>${esc(codes)}</td>
+          <td>${esc(msg)}</td>
+          <td>${detailCell}</td>
+          <td>${aiActionCell(r)}</td></tr>`;
+      }).join('') || emptyRow(9);
+    } catch (e) { if (e.message !== '401') tbody.innerHTML = errRow(9, e); }
+  }
+
+  // ── AI error-resolution modal ────────────────────────────────────────────
+  let aiModalUuid = null;
+  let aiModalResolution = null;
+
+  const aiOverlay = $('#aiModalOverlay');
+  const aiBody = $('#aiModalBody');
+  const aiStatusEl = $('#aiModalStatus');
+  const aiSubtitle = $('#aiModalSubtitle');
+  const aiApplyBtn = $('#aiApplyBtn');
+  const aiRejectBtn = $('#aiRejectBtn');
+  const aiRerunBtn = $('#aiRerunBtn');
+
+  function setAiStatus(text, tone) {
+    if (!aiStatusEl) return;
+    aiStatusEl.textContent = text || '';
+    aiStatusEl.style.color = tone === 'bad' ? 'var(--color-neg-text)' : tone === 'ok' ? 'var(--color-pos-text)' : '';
+  }
+  function setAiButtonsDisabled(disabled) {
+    [aiApplyBtn, aiRejectBtn, aiRerunBtn].forEach((b) => { if (b) b.disabled = disabled; });
+  }
+
+  function openAiModal(uuid) {
+    aiModalUuid = uuid;
+    aiModalResolution = null;
+    const rec = errorsByUuid.get(uuid);
+    if (aiSubtitle) {
+      aiSubtitle.textContent = rec
+        ? `${rec.asin || ''} · ${rec.sku || ''} · ${rec.marketplace_code || ''} · ${rec.product_type || ''}`
+        : uuid;
+    }
+    if (aiBody) aiBody.innerHTML = '<div class="ai-loading">Reviewing the error with the model… this can take several seconds.</div>';
+    setAiStatus('');
+    setAiButtonsDisabled(true);
+    if (aiOverlay) aiOverlay.hidden = false;
+    // Use the cached resolution if present (status badge implies one exists),
+    // otherwise kick off a fresh review.
+    const hasCached = rec && rec.aiResolution;
+    runReview(uuid, false, !hasCached);
+  }
+
+  function closeAiModal() {
+    if (aiOverlay) aiOverlay.hidden = true;
+    aiModalUuid = null;
+    aiModalResolution = null;
+  }
+
+  async function runReview(uuid, force, postIfMissing) {
+    setAiButtonsDisabled(true);
+    setAiStatus(force ? 'Re-running model…' : 'Loading review…');
+    try {
+      let resolution = null;
+      if (!force && !postIfMissing) {
+        // Try the cached resolution first (no model call).
+        try {
+          const got = await api(`/admin/errors/${encodeURIComponent(uuid)}/review`);
+          resolution = got.resolution;
+        } catch (_) { /* fall through to POST */ }
+      }
+      if (!resolution) {
+        const out = await apiPost(`/admin/errors/${encodeURIComponent(uuid)}/review${force ? '?force=1' : ''}`);
+        resolution = out.resolution;
+      }
+      aiModalResolution = resolution;
+      renderResolution(resolution);
+      setAiStatus('');
+    } catch (err) {
+      if (err.message === '401') return;
+      if (aiBody) aiBody.innerHTML = `<div class="ai-error">Review failed: ${esc(err.message)}</div>`;
+      setAiStatus(err.message, 'bad');
+      // Re-run stays enabled so the operator can retry.
+      if (aiRerunBtn) aiRerunBtn.disabled = false;
+    }
+  }
+
+  function listBlock(title, items, tone) {
+    if (!items || !items.length) return '';
+    const lis = items.map((x) => `<li>${esc(typeof x === 'string' ? x : (x.field ? `${x.field}: ${x.reason || ''}` : JSON.stringify(x)))}</li>`).join('');
+    return `<div class="ai-section ${tone || ''}"><h4>${esc(title)}</h4><ul>${lis}</ul></div>`;
+  }
+
+  function renderResolution(r) {
+    if (!r) { if (aiBody) aiBody.innerHTML = '<div class="ai-error">No resolution returned.</div>'; return; }
+    const applied = r.status === 'APPLIED';
+    const pkgJson = r.proposedPackage ? JSON.stringify(r.proposedPackage, null, 2) : '';
+    const validationProblems = (r.validation && !r.validation.ok) ? (r.validation.problems || []) : [];
+    const confTxt = (r.confidence != null) ? `${r.confidence}%` : '—';
+    const head = `<div class="ai-meta">
+        <span class="badge ${applied ? 'ok' : r.status === 'REJECTED' || r.status === 'FAILED' ? 'bad' : 'warn'}">${esc(r.status)}</span>
+        <span class="ai-meta-item">Confidence: <strong>${esc(confTxt)}</strong></span>
+        <span class="ai-meta-item">Operation: <code>${esc(r.operation || '')}</code></span>
+        <span class="ai-meta-item">Model: <code>${esc(r.model || '')}</code></span>
+        ${r.appliedSubmissionUuid ? `<span class="ai-meta-item">Pushed as <code>${esc(String(r.appliedSubmissionUuid).slice(0, 8))}</code></span>` : ''}
+      </div>`;
+    const diag = `<div class="ai-section"><h4>Diagnosis</h4><p>${esc(r.diagnosis || '—')}</p></div>`;
+    const root = r.root_cause ? `<div class="ai-section"><h4>Root cause</h4><p>${esc(r.root_cause)}</p></div>` : '';
+    const changed = (r.changedAttrNames && r.changedAttrNames.length)
+      ? `<div class="ai-section"><h4>Attributes changed</h4><p>${r.changedAttrNames.map((n) => `<code>${esc(n)}</code>`).join(' ')}</p></div>`
+      : '';
+    const unresolved = listBlock('Unresolved (needs data the model could not source)', r.unresolved, 'warn');
+    const warnings = listBlock('Warnings', r.warnings, 'warn');
+    const valBlock = validationProblems.length ? listBlock('Validation problems (must be fixed before push)', validationProblems, 'bad') : '';
+    const editorNote = applied
+      ? '<p class="ai-hint">This fix has already been pushed. The package is read-only.</p>'
+      : '<p class="ai-hint">Review and edit the corrected package below if needed, then Approve &amp; push. It will be validated against the live product type schema before being sent.</p>';
+    const editor = `<div class="ai-section">
+        <h4>Proposed package (${esc(r.operation || '')})</h4>
+        ${editorNote}
+        <textarea id="aiPackageEditor" class="ai-editor" spellcheck="false" ${applied ? 'readonly' : ''}>${esc(pkgJson)}</textarea>
+      </div>`;
+    if (aiBody) aiBody.innerHTML = head + diag + root + changed + unresolved + warnings + valBlock + editor;
+
+    // Button states.
+    if (aiApplyBtn) {
+      aiApplyBtn.disabled = applied || !pkgJson;
+      aiApplyBtn.textContent = applied ? 'Pushed' : 'Approve & push';
+    }
+    if (aiRejectBtn) aiRejectBtn.disabled = applied || r.status === 'REJECTED';
+    if (aiRerunBtn) aiRerunBtn.disabled = applied;
+  }
+
+  async function applyAiFix() {
+    if (!aiModalUuid || !aiModalResolution) return;
+    const editor = $('#aiPackageEditor');
+    if (!editor) return;
+    let pkg;
+    try { pkg = JSON.parse(editor.value); }
+    catch (err) { alert('The package is not valid JSON: ' + err.message); return; }
+    if (!confirm('Approve and push this corrected package to Amazon? It will be validated and sent as a new submission.')) return;
+    setAiButtonsDisabled(true);
+    setAiStatus('Validating and pushing…');
+    try {
+      const out = await apiPost(`/admin/errors/${encodeURIComponent(aiModalUuid)}/apply`, {
+        package: pkg,
+        operation: aiModalResolution.operation
+      });
+      setAiStatus(`Pushed as ${String(out.submissionId).slice(0, 8)} — status ${out.status}`, out.status === 'APPLIED' ? 'ok' : 'bad');
+      await loadErrors();
+      loadQueue();
+      // Reflect the applied state in the modal.
+      const refreshed = errorsByUuid.get(aiModalUuid);
+      if (refreshed && refreshed.aiResolution) {
+        aiModalResolution.status = 'APPLIED';
+        aiModalResolution.appliedSubmissionUuid = out.submissionId;
+        renderResolution(aiModalResolution);
+      }
+    } catch (err) {
+      if (err.message === '401') return;
+      setAiStatus('Push failed: ' + err.message, 'bad');
+      setAiButtonsDisabled(false);
+      alert('Approve & push failed: ' + err.message);
+    }
+  }
+
+  async function rejectAiFix() {
+    if (!aiModalUuid) return;
+    if (!confirm('Reject this proposed fix? It will be discarded (nothing is sent to Amazon).')) return;
+    setAiButtonsDisabled(true);
+    setAiStatus('Rejecting…');
+    try {
+      await apiPost(`/admin/errors/${encodeURIComponent(aiModalUuid)}/reject`);
+      setAiStatus('Rejected.', 'ok');
+      await loadErrors();
+      closeAiModal();
+    } catch (err) {
+      if (err.message === '401') return;
+      setAiStatus('Reject failed: ' + err.message, 'bad');
+      setAiButtonsDisabled(false);
+    }
+  }
+
+  async function reviewAllErrors() {
+    const btn = $('#reviewAllErrors');
+    const statusEl = $('#errorsReviewStatus');
+    if (!confirm('Run the AI review on all un-reviewed failed submissions? This calls the model once per submission.')) return;
+    if (btn) btn.disabled = true;
+    if (statusEl) statusEl.textContent = 'Reviewing…';
+    try {
+      const out = await apiPost('/admin/errors/review-batch', { limit: 25 });
+      if (statusEl) statusEl.textContent = `Reviewed ${out.reviewed}, skipped ${out.skipped}, failed ${out.failed} of ${out.totalFailed}.`;
+      await loadErrors();
+    } catch (err) {
+      if (err.message === '401') return;
+      if (statusEl) statusEl.textContent = 'Batch review failed: ' + err.message;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  if (aiApplyBtn) aiApplyBtn.addEventListener('click', applyAiFix);
+  if (aiRejectBtn) aiRejectBtn.addEventListener('click', rejectAiFix);
+  if (aiRerunBtn) aiRerunBtn.addEventListener('click', () => { if (aiModalUuid) runReview(aiModalUuid, true, true); });
+  const aiModalClose = $('#aiModalClose');
+  if (aiModalClose) aiModalClose.addEventListener('click', closeAiModal);
+  if (aiOverlay) aiOverlay.addEventListener('click', (e) => { if (e.target === aiOverlay) closeAiModal(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && aiOverlay && !aiOverlay.hidden) closeAiModal(); });
+
+  const reviewAllBtn = $('#reviewAllErrors');
+  if (reviewAllBtn) reviewAllBtn.addEventListener('click', reviewAllErrors);
+
+  $('#errorsTable').addEventListener('click', (e) => {
+    const btn = e.target.closest('button.ai-review-btn');
+    if (!btn) return;
+    openAiModal(btn.dataset.uuid);
+  });
+
+  const loaders = { queue: loadQueue, jobs: loadJobs, audit: loadAudit, errors: loadErrors };
   function activeTab() {
     const el = document.querySelector('.sidebar-item.active[data-tab]');
     return el ? el.dataset.tab : 'queue';
   }
   function refreshActive() {
+    loadMetrics();
     loadStatus();
     loaders[activeTab()]();
   }
@@ -1381,6 +1787,7 @@
     syncQueueSelectionControls();
   });
   $('#approveSelectedQueue').addEventListener('click', approveSelectedQueue);
+  $('#rejectSelectedQueue').addEventListener('click', rejectSelectedQueue);
 
   // Expand a row to show field-by-field change details. Group rows (carry
   // data-job) expand into the before/posted/after table for the whole job.
@@ -1453,5 +1860,6 @@
 
   loadQueueColState();
   refreshActive();
+  setInterval(loadMetrics, 15000);
   setInterval(loadStatus, 30000);
 })();
