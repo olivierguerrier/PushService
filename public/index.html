@@ -13,7 +13,7 @@
 <title>Amazon Push Service — console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link rel="stylesheet" href="/styles.css?v=20260617-3" />
+<link rel="stylesheet" href="/styles.css?v=20260618-1" />
 </head>
 <body>
   <aside id="sidebar" class="sidebar">
@@ -162,16 +162,58 @@
 
     <section class="panel tabview hidden" id="tab-jobs">
       <div class="toolbar">
-        <h2>Recent jobs</h2>
+        <h2>Jobs</h2>
+        <input id="jobsSearch" type="search" placeholder="Search jobs (id, ASIN, caller, kind, fields, status…)" aria-label="Search jobs" />
+        <span id="jobsSearchStatus" class="bulk-status"></span>
         <button id="approveSelectedJobs" class="bulk-approve" type="button" disabled>Approve selected</button>
         <span id="jobBulkStatus" class="bulk-status"></span>
         <button class="refresh" data-refresh="jobs">Refresh</button>
+        <a id="jobsExportLink" class="export-btn" href="#">Export CSV</a>
+        <div class="col-selector-wrapper" id="jobsColSelectorWrapper">
+          <button type="button" class="col-selector-btn" id="jobsColSelectorBtn" aria-expanded="false">
+            <span class="btn-icon" aria-hidden="true">⊞</span> Columns
+          </button>
+          <div class="col-selector-panel" id="jobsColSelectorPanel">
+            <div class="col-selector-header">
+              <span class="col-selector-title">Columns</span>
+              <div class="col-selector-actions">
+                <button type="button" class="col-selector-action-btn" id="jobsColAutoFit">Auto-fit</button>
+                <button type="button" class="col-selector-action-btn" id="jobsColReset">Reset</button>
+              </div>
+            </div>
+            <div class="col-selector-hint">
+              Drag headers to reorder. Drag right edge to resize. Double-click edge to auto-fit.
+            </div>
+            <div class="col-selector-list" id="jobsColSelectorList"></div>
+          </div>
+        </div>
       </div>
-      <div class="tablewrap"><table id="jobsTable"><thead><tr>
-        <th class="select-cell"><input id="selectAllJobs" type="checkbox" aria-label="Select all approvable jobs" /></th>
-        <th>Created</th><th>Job</th><th>Kind</th><th>Caller</th><th>ASIN</th>
-        <th>OK</th><th>Failed</th><th>Total</th><th>Pending approval</th><th>Status</th>
-      </tr></thead><tbody></tbody></table></div>
+      <div id="jobsColumnFiltersBar" class="column-filters-bar hidden">
+        <span id="jobsColumnFiltersBarText"></span>
+        <button type="button" class="column-filters-clear" id="jobsColumnFiltersClear">Clear all</button>
+      </div>
+      <div class="tablewrap"><table id="jobsTable" data-col-widths-key="aps_jobs_col_widths"><thead><tr></tr></thead><tbody></tbody></table></div>
+      <div id="jobsPagination" class="pagination-bar hidden">
+        <div class="pagination-info" id="jobsPaginationInfo"></div>
+        <div class="pagination-controls">
+          <label class="pagination-size">Rows per page
+            <select id="jobsPageSize" aria-label="Rows per page">
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+            </select>
+          </label>
+          <div class="pagination-nav">
+            <button type="button" id="jobsPageFirst" class="pagination-btn" aria-label="First page" title="First page">&laquo;</button>
+            <button type="button" id="jobsPagePrev" class="pagination-btn" aria-label="Previous page" title="Previous page">&lsaquo;</button>
+            <span id="jobsPageIndicator" class="pagination-indicator"></span>
+            <button type="button" id="jobsPageNext" class="pagination-btn" aria-label="Next page" title="Next page">&rsaquo;</button>
+            <button type="button" id="jobsPageLast" class="pagination-btn" aria-label="Last page" title="Last page">&raquo;</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section class="panel tabview hidden" id="tab-audit">
@@ -191,20 +233,56 @@
       <div class="toolbar">
         <h2>Amazon errors</h2>
         <span id="errorsCount" class="bulk-status"></span>
+        <button id="archiveSelectedErrors" class="bulk-approve" type="button" disabled>Archive selected</button>
+        <button id="retrySelectedErrors" class="bulk-approve" type="button" disabled>Retry selected</button>
+        <button id="unarchiveSelectedErrors" class="bulk-approve" type="button" hidden disabled>Unarchive selected</button>
+        <button id="reviewSelectedErrors" class="bulk-approve" type="button" hidden disabled>Review selected (AI)</button>
         <button id="reviewAllErrors" class="bulk-approve" type="button" hidden>Review all (AI)</button>
+        <span id="errorsBulkStatus" class="bulk-status"></span>
         <span id="errorsReviewStatus" class="bulk-status"></span>
         <button class="refresh" data-refresh="errors">Refresh</button>
         <a id="errorsExportLink" class="export-btn" href="#">Export Excel</a>
       </div>
+      <nav class="view-subtabs" id="errorsSubtabs" aria-label="Error list view">
+        <button type="button" class="view-subtab active" data-errors-view="active">Active</button>
+        <button type="button" class="view-subtab" data-errors-view="archived">Archived</button>
+      </nav>
+      <div id="errorsColumnFiltersBar" class="column-filters-bar hidden">
+        <span id="errorsColumnFiltersBarText"></span>
+        <button type="button" class="column-filters-clear" id="errorsColumnFiltersClear">Clear all</button>
+      </div>
       <div class="tablewrap"><table id="errorsTable"><thead><tr>
+        <th class="select-cell"><input id="selectAllErrors" type="checkbox" aria-label="Select all visible errors" /></th>
         <th>Created</th><th>Status</th><th>ASIN</th><th>SKU</th><th>Mkt</th>
-        <th>Codes</th><th>Message</th><th>Details</th><th>AI fix</th>
+        <th>Codes</th><th>Message</th><th>Details</th><th>Retry</th><th>AI fix</th><th>Archive</th>
       </tr></thead><tbody></tbody></table></div>
+      <div id="errorsPagination" class="pagination-bar hidden">
+        <div class="pagination-info" id="errorsPaginationInfo"></div>
+        <div class="pagination-controls">
+          <label class="pagination-size">Rows per page
+            <select id="errorsPageSize" aria-label="Rows per page">
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+            </select>
+          </label>
+          <div class="pagination-nav">
+            <button type="button" id="errorsPageFirst" class="pagination-btn" aria-label="First page" title="First page">&laquo;</button>
+            <button type="button" id="errorsPagePrev" class="pagination-btn" aria-label="Previous page" title="Previous page">&lsaquo;</button>
+            <span id="errorsPageIndicator" class="pagination-indicator"></span>
+            <button type="button" id="errorsPageNext" class="pagination-btn" aria-label="Next page" title="Next page">&rsaquo;</button>
+            <button type="button" id="errorsPageLast" class="pagination-btn" aria-label="Last page" title="Last page">&raquo;</button>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
   </div>
 
   <div class="col-selector-overlay" id="queueColSelectorOverlay"></div>
+  <div class="col-selector-overlay" id="jobsColSelectorOverlay"></div>
 
   <!-- AI error-resolution review modal -->
   <div id="aiModalOverlay" class="ai-modal-overlay" hidden>
@@ -229,6 +307,6 @@
 
   <script src="/col-filter.js?v=20260617-1"></script>
   <script src="/column-ui.js?v=20260617-1"></script>
-  <script src="/app.js?v=20260617-3"></script>
+  <script src="/app.js?v=20260618-2"></script>
 </body>
 </html>

@@ -134,7 +134,8 @@ function listErrors({ limit = 1000 } = {}) {
     SELECT submission_uuid, job_uuid, caller, scope, operation, vendor_code, sku,
            parent_sku, effective_sku, asin, item_number, marketplace_code, product_type,
            status, approved_by, approved_at, error_message, issues_json,
-           amazon_response_json, feed_id, feed_document_id, created_at, updated_at
+           amazon_response_json, feed_id, feed_document_id, archived_at, archived_by,
+           created_at, updated_at
     FROM push_submissions
     WHERE status = 'FAILED'
        OR (error_message IS NOT NULL AND error_message != '')
@@ -143,4 +144,26 @@ function listErrors({ limit = 1000 } = {}) {
   `).all();
 }
 
-module.exports = { insert, getByUuid, getByIdempotencyKey, getByApprovalToken, update, listRecent, count, listForJob, listErrors };
+// Archive (or un-archive) one error submission. An archived submission is
+// skipped by the AI error resolver — no single or batch AI fix is assessed for
+// it — but it stays visible in the Errors tab. `archived` toggles the state;
+// `actor` stamps who did it (cleared on un-archive).
+function setArchived(uuid, { archived = true, actor = null } = {}) {
+  const db = getDb();
+  if (archived) {
+    db.prepare(`
+      UPDATE push_submissions
+      SET archived_at = datetime('now'), archived_by = ?, updated_at = datetime('now')
+      WHERE submission_uuid = ?
+    `).run(actor, uuid);
+  } else {
+    db.prepare(`
+      UPDATE push_submissions
+      SET archived_at = NULL, archived_by = NULL, updated_at = datetime('now')
+      WHERE submission_uuid = ?
+    `).run(uuid);
+  }
+  return getByUuid(uuid);
+}
+
+module.exports = { insert, getByUuid, getByIdempotencyKey, getByApprovalToken, update, listRecent, count, listForJob, listErrors, setArchived };

@@ -18,12 +18,79 @@ function countByStatus(table, statusCol, statuses) {
 function settledInWindow(minutes) {
   const db = getDb();
   const placeholders = SETTLED_SUB_STATUSES.map(() => '?').join(', ');
+  const modifier = minutes >= 1
+    ? `-${minutes} minutes`
+    : `-${Math.max(1, Math.round(minutes * 60))} seconds`;
   const row = db.prepare(`
     SELECT COUNT(*) AS n FROM push_submissions
     WHERE status IN (${placeholders})
       AND updated_at >= datetime('now', ?)
-  `).get(...SETTLED_SUB_STATUSES, `-${minutes} minutes`);
+  `).get(...SETTLED_SUB_STATUSES, modifier);
   return Number(row && row.n) || 0;
+}
+
+function activeThroughputStart() {
+  const db = getDb();
+  const settledPh = SETTLED_SUB_STATUSES.map(() => '?').join(', ');
+  const activePh = ACTIVE_SUB_STATUSES.map(() => '?').join(', ');
+  const row = db.prepare(`
+    SELECT MIN(COALESCE(j.started_at, j.created_at)) AS started
+    FROM push_jobs j
+    WHERE j.created_at >= datetime('now', ?)
+      AND (
+        j.status IN ('pending', 'running')
+        OR EXISTS (
+          SELECT 1 FROM push_submissions s
+          WHERE s.job_uuid = j.job_uuid
+            AND (
+              s.status IN (${activePh})
+              OR (
+                s.status IN (${settledPh})
+                AND s.updated_at >= datetime('now', ?)
+              )
+            )
+        )
+      )
+  `).get(
+    `-${DASHBOARD_WINDOW_HOURS} hours`,
+    ...ACTIVE_SUB_STATUSES,
+    ...SETTLED_SUB_STATUSES,
+    `-${THROUGHPUT_WINDOW_MIN} minutes`
+  );
+  return row && row.started ? row.started : null;
+}
+
+function computeThroughput() {
+  const startIso = activeThroughputStart();
+  if (!startIso) {
+    const settled = settledInWindow(THROUGHPUT_WINDOW_MIN);
+    return {
+      windowMinutes: THROUGHPUT_WINDOW_MIN,
+      sinceStart: false,
+      settled,
+      perMinute: settled / THROUGHPUT_WINDOW_MIN
+    };
+  }
+
+  const elapsedMinutes = Math.max(0, (Date.now() - new Date(startIso).getTime()) / 60000);
+  if (elapsedMinutes >= THROUGHPUT_WINDOW_MIN) {
+    const settled = settledInWindow(THROUGHPUT_WINDOW_MIN);
+    return {
+      windowMinutes: THROUGHPUT_WINDOW_MIN,
+      sinceStart: false,
+      settled,
+      perMinute: settled / THROUGHPUT_WINDOW_MIN
+    };
+  }
+
+  const windowMinutes = Math.max(elapsedMinutes, 1 / 60);
+  const settled = settledInWindow(windowMinutes);
+  return {
+    windowMinutes: Math.round(windowMinutes * 10) / 10,
+    sinceStart: true,
+    settled,
+    perMinute: settled / windowMinutes
+  };
 }
 
 function jobsInWindow(hours) {
@@ -87,8 +154,8 @@ function submissionProgressInWindow(hours) {
 function getDashboard() {
   const jobs24h = jobsInWindow(DASHBOARD_WINDOW_HOURS);
   const progress24h = submissionProgressInWindow(DASHBOARD_WINDOW_HOURS);
-  const settled = settledInWindow(THROUGHPUT_WINDOW_MIN);
-  const perMinute = settled / THROUGHPUT_WINDOW_MIN;
+  const throughput = computeThroughput();
+  const { settled, perMinute } = throughput;
   const remaining = progress24h.remaining;
   let etaSeconds = null;
   if (remaining > 0 && perMinute > 0) {
@@ -106,7 +173,8 @@ function getDashboard() {
     progress24h,
     progress: progress24h,
     throughput: {
-      windowMinutes: THROUGHPUT_WINDOW_MIN,
+      windowMinutes: throughput.windowMinutes,
+      sinceStart: throughput.sinceStart,
       settled,
       perMinute: Math.round(perMinute * 10) / 10
     },

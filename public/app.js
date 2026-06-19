@@ -70,6 +70,10 @@
       const active = m.submissionsActive || 0;
       const speed = m.throughput && m.throughput.perMinute != null ? m.throughput.perMinute : 0;
       const windowMin = (m.throughput && m.throughput.windowMinutes) || 15;
+      const settledCount = (m.throughput && m.throughput.settled) || 0;
+      const speedDetail = m.throughput && m.throughput.sinceStart
+        ? `${settledCount} settled since start (${windowMin} min)`
+        : `${settledCount} settled in last ${windowMin} min`;
       const etaText = active === 0 && !(m.progress24h && m.progress24h.remaining)
         ? 'Idle'
         : m.eta && m.eta.available
@@ -82,8 +86,7 @@
           `${j24.running || 0} running · ${finished} finished`],
         ['Active submissions', String(active), active ? 'warn' : '',
           `${m.submissionsPendingApproval} awaiting approval · ${m.submissionsInFlight} in flight`],
-        ['Job speed', speed ? `${speed}/min` : '0/min', speed ? 'pos' : '',
-          `${(m.throughput && m.throughput.settled) || 0} settled in last ${windowMin} min`],
+        ['Job speed', speed ? `${speed}/min` : '0/min', speed ? 'pos' : '', speedDetail],
         ['Est. completion', etaText, etaTone,
           m.approvalQueueDepth ? `${m.approvalQueueDepth} queued for SP-API` : 'No queued writes']
       ];
@@ -154,7 +157,6 @@
     }
   }
 
-  const JOB_COLS = 11;   // keep in sync with #jobsTable header cell count
   const changesCache = new Map(); // submission uuid / 'grp:'+id -> rendered detail HTML
   const groupSubs = new Map();    // group id -> array of submission rows in the group
   const subsByUuid = new Map();   // submission uuid -> last loaded queue row (for meta lookup)
@@ -165,6 +167,9 @@
   const selectedJobIds = new Set();
   let jobBulkBusy = false;
   let jobBulkMessage = '';
+  const selectedErrorUuids = new Set();
+  let errorBulkBusy = false;
+  let errorBulkMessage = '';
 
   // ── Queue table columns (sort / filter / reorder / resize) ───────────────
   const QUEUE_COLUMN_DEFS = [
@@ -1290,6 +1295,24 @@
   const queueFiltersClear = $('#queueColumnFiltersClear');
   if (queueFiltersClear) queueFiltersClear.addEventListener('click', clearAllQueueColumnFilters);
 
+  // ── Jobs column selector wiring ──────────────────────────────────────────
+  const jobsColBtn = $('#jobsColSelectorBtn');
+  const jobsColOverlay = $('#jobsColSelectorOverlay');
+  if (jobsColBtn) jobsColBtn.addEventListener('click', toggleJobsColSelector);
+  if (jobsColOverlay) jobsColOverlay.addEventListener('click', closeJobsColSelector);
+  const jobsColAutoFit = $('#jobsColAutoFit');
+  if (jobsColAutoFit) {
+    jobsColAutoFit.addEventListener('click', () => {
+      const table = $('#jobsTable');
+      if (table) columnUi.autoFitAllColumns(table);
+      buildJobsColSelectorList();
+    });
+  }
+  const jobsColReset = $('#jobsColReset');
+  if (jobsColReset) jobsColReset.addEventListener('click', resetJobsColumns);
+  const jobsFiltersClear = $('#jobsColumnFiltersClear');
+  if (jobsFiltersClear) jobsFiltersClear.addEventListener('click', clearAllJobsColumnFilters);
+
   // ── Pagination controls ──────────────────────────────────────────────────
   loadQueuePageSize();
   const queuePageSizeSel = $('#queuePageSize');
@@ -1313,35 +1336,617 @@
   const queuePageLast = $('#queuePageLast');
   if (queuePageLast) queuePageLast.addEventListener('click', () => goToQueuePage(Number.MAX_SAFE_INTEGER));
 
+  const JOBS_FETCH_LIMIT = 500;
+  const JOBS_MAX_ROWS = 25000;
+  const JOBS_PAGE_SIZES = [50, 100, 200, 500, 1000];
+  const JOBS_PAGE_STORAGE = 'aps_jobs_page_size';
+  const jobsPageState = { page: 1, pageSize: 200, fetchCapped: false };
+  let jobsSearchTimer = null;
+  let jobsDisplayItems = [];
+
+  function loadJobsPageSize() {
+    try {
+      const saved = Number(localStorage.getItem(JOBS_PAGE_STORAGE));
+      if (JOBS_PAGE_SIZES.includes(saved)) jobsPageState.pageSize = saved;
+    } catch (_) { /* default */ }
+  }
+  function saveJobsPageSize() {
+    try { localStorage.setItem(JOBS_PAGE_STORAGE, String(jobsPageState.pageSize)); } catch (_) {}
+  }
+
+  loadJobsPageSize();
+  const jobsPageSizeSel = $('#jobsPageSize');
+  if (jobsPageSizeSel) {
+    jobsPageSizeSel.value = String(jobsPageState.pageSize);
+    jobsPageSizeSel.addEventListener('change', () => {
+      const size = Number(jobsPageSizeSel.value);
+      if (!JOBS_PAGE_SIZES.includes(size)) return;
+      jobsPageState.pageSize = size;
+      jobsPageState.page = 1;
+      saveJobsPageSize();
+      renderJobsTable();
+    });
+  }
+  const jobsPageFirst = $('#jobsPageFirst');
+  if (jobsPageFirst) jobsPageFirst.addEventListener('click', () => goToJobsPage(1));
+  const jobsPagePrev = $('#jobsPagePrev');
+  if (jobsPagePrev) jobsPagePrev.addEventListener('click', () => goToJobsPage(jobsPageState.page - 1));
+  const jobsPageNext = $('#jobsPageNext');
+  if (jobsPageNext) jobsPageNext.addEventListener('click', () => goToJobsPage(jobsPageState.page + 1));
+  const jobsPageLast = $('#jobsPageLast');
+  if (jobsPageLast) jobsPageLast.addEventListener('click', () => goToJobsPage(Number.MAX_SAFE_INTEGER));
+
+  // ── Jobs table columns (sort / filter / reorder / resize) ────────────────
+  const JOBS_COLUMN_DEFS = [
+    { key: 'select', label: '', nohide: true, sortable: false, filterable: false, fixed: true },
+    { key: 'created_at', label: 'Created', sortable: true, filterable: true },
+    { key: 'job_id', label: 'Job', sortable: true, filterable: true },
+    { key: 'kind', label: 'Kind', sortable: true, filterable: true },
+    { key: 'caller', label: 'Caller', sortable: true, filterable: true },
+    { key: 'asin', label: 'ASIN', sortable: true, filterable: true },
+    { key: 'item_number', label: 'Item #', sortable: true, filterable: true },
+    { key: 'marketplace_code', label: 'Mkt', sortable: true, filterable: true },
+    { key: 'label', label: 'Label', sortable: true, filterable: true },
+    { key: 'fields', label: 'Fields', sortable: true, filterable: true, title: 'Amazon attributes included in this push' },
+    { key: 'ok_count', label: 'OK', sortable: true, filterable: true },
+    { key: 'failed_count', label: 'Failed', sortable: true, filterable: true },
+    { key: 'target_count', label: 'Total', sortable: true, filterable: true },
+    { key: 'pending_approval', label: 'Pending approval', sortable: true, filterable: true },
+    { key: 'status', label: 'Status', sortable: true, filterable: true },
+    { key: 'requested_by', label: 'Requested by', sortable: true, filterable: true }
+  ];
+  const JOBS_COL_KEYS = JOBS_COLUMN_DEFS.map((c) => c.key);
+  const JOBS_STORAGE = {
+    hidden: 'aps_jobs_hidden',
+    order: 'aps_jobs_order',
+    sort: 'aps_jobs_sort',
+    filters: 'aps_jobs_col_filters'
+  };
+  const jobsColState = {
+    hidden: new Set(['item_number', 'marketplace_code', 'label', 'requested_by']),
+    order: [],
+    sortField: 'created_at',
+    sortDir: 'desc',
+    filters: {}
+  };
+
+  function loadJobsColState() {
+    try {
+      const hidden = JSON.parse(localStorage.getItem(JOBS_STORAGE.hidden) || '[]');
+      jobsColState.hidden = new Set(Array.isArray(hidden) ? hidden : []);
+    } catch (_) { jobsColState.hidden = new Set(['item_number', 'marketplace_code', 'label', 'requested_by']); }
+    try {
+      const order = (localStorage.getItem(JOBS_STORAGE.order) || '').split(',').map((s) => s.trim()).filter(Boolean);
+      jobsColState.order = order.filter((k) => JOBS_COL_KEYS.includes(k));
+    } catch (_) { jobsColState.order = []; }
+    try {
+      const sort = JSON.parse(localStorage.getItem(JOBS_STORAGE.sort) || '{}');
+      if (sort.field && JOBS_COL_KEYS.includes(sort.field)) {
+        jobsColState.sortField = sort.field;
+        jobsColState.sortDir = sort.dir === 'asc' ? 'asc' : 'desc';
+      }
+    } catch (_) { /* defaults */ }
+    try {
+      const filters = JSON.parse(localStorage.getItem(JOBS_STORAGE.filters) || '{}');
+      jobsColState.filters = {};
+      for (const [k, vals] of Object.entries(filters)) {
+        if (JOBS_COL_KEYS.includes(k) && Array.isArray(vals) && vals.length) {
+          jobsColState.filters[k] = new Set(vals.map(String));
+        }
+      }
+    } catch (_) { jobsColState.filters = {}; }
+    for (const def of JOBS_COLUMN_DEFS) {
+      if (def.nohide) jobsColState.hidden.delete(def.key);
+    }
+  }
+  function saveJobsHidden() {
+    localStorage.setItem(JOBS_STORAGE.hidden, JSON.stringify([...jobsColState.hidden]));
+  }
+  function saveJobsOrder() {
+    localStorage.setItem(JOBS_STORAGE.order, jobsColState.order.join(','));
+  }
+  function saveJobsSort() {
+    localStorage.setItem(JOBS_STORAGE.sort, JSON.stringify({ field: jobsColState.sortField, dir: jobsColState.sortDir }));
+  }
+  function saveJobsFilters() {
+    const out = {};
+    for (const [k, set] of Object.entries(jobsColState.filters)) {
+      if (set && set.size) out[k] = [...set];
+    }
+    localStorage.setItem(JOBS_STORAGE.filters, JSON.stringify(out));
+  }
+  function fullJobsColumnOrder() {
+    const base = jobsColState.order.length
+      ? jobsColState.order.slice()
+      : JOBS_COL_KEYS.slice();
+    for (const k of JOBS_COL_KEYS) {
+      if (!base.includes(k)) base.push(k);
+    }
+    const fixedStart = ['select'];
+    const middle = base.filter((k) => JOBS_COL_KEYS.includes(k) && !fixedStart.includes(k));
+    return fixedStart.concat(middle);
+  }
+  function visibleJobsColumns() {
+    return fullJobsColumnOrder()
+      .map((k) => JOBS_COLUMN_DEFS.find((d) => d.key === k))
+      .filter((c) => c && (!jobsColState.hidden.has(c.key) || c.nohide));
+  }
+  function visibleJobsColCount() {
+    return visibleJobsColumns().length;
+  }
+
+  function jobFieldNames(j) {
+    return Array.isArray(j.fieldNames) ? j.fieldNames.filter(Boolean).map(String) : [];
+  }
+  function fieldsCellHtml(j) {
+    const names = jobFieldNames(j);
+    if (!names.length) return '<span class="muted-cell">—</span>';
+    const title = names.join(', ');
+    if (names.length <= 3) {
+      return `<span class="field-tags" title="${esc(title)}">${names.map((n) => `<span class="field-tag">${esc(n)}</span>`).join('')}</span>`;
+    }
+    const shown = names.slice(0, 2).map((n) => `<span class="field-tag">${esc(n)}</span>`).join('');
+    return `<span class="field-tags" title="${esc(title)}">${shown}<span class="field-tag field-tag-more">+${names.length - 2}</span></span>`;
+  }
+
+  function jobFilterValue(j, key) {
+    switch (key) {
+      case 'job_id': return String(j.jobId || '').slice(0, 8);
+      case 'created_at': return String(j.createdAt || '');
+      case 'item_number': return String(j.itemNumber || '');
+      case 'marketplace_code': return String(j.marketplaceCode || '');
+      case 'label': return String(j.label || '');
+      case 'fields': return jobFieldNames(j).sort().join(', ');
+      case 'ok_count': return String(j.okCount ?? '');
+      case 'failed_count': return String(j.failedCount ?? '');
+      case 'target_count': return String(j.targetCount ?? '');
+      case 'pending_approval': return String(j.pendingApprovalCount ?? '');
+      case 'requested_by': return String(j.requestedBy || '');
+      case 'status': return String(j.status || '');
+      default: return j[key] == null ? '' : String(j[key]);
+    }
+  }
+
+  function jobSortValue(j, key) {
+    if (key === 'created_at') return j.createdAt || '';
+    if (key === 'ok_count' || key === 'failed_count' || key === 'target_count' || key === 'pending_approval') {
+      return Number(jobFilterValue(j, key)) || 0;
+    }
+    const raw = jobFilterValue(j, key);
+    return typeof raw === 'string' ? raw.toLowerCase() : raw;
+  }
+
+  function jobMatchesColumnFilter(j, key, allowed) {
+    if (!allowed || !allowed.size) return true;
+    if (key === 'fields') {
+      const names = jobFieldNames(j);
+      return names.some((n) => allowed.has(n));
+    }
+    return allowed.has(jobFilterValue(j, key));
+  }
+
+  function applyJobsFiltersAndSort(items) {
+    let rows = items.slice();
+    for (const [key, allowed] of Object.entries(jobsColState.filters)) {
+      if (!allowed || !allowed.size) continue;
+      rows = rows.filter((j) => jobMatchesColumnFilter(j, key, allowed));
+    }
+    const field = jobsColState.sortField;
+    const dir = jobsColState.sortDir === 'asc' ? 1 : -1;
+    if (field && JOBS_COL_KEYS.includes(field)) {
+      rows.sort((a, b) => {
+        const av = jobSortValue(a, field);
+        const bv = jobSortValue(b, field);
+        if (av < bv) return -1 * dir;
+        if (av > bv) return 1 * dir;
+        return 0;
+      });
+    }
+    return rows;
+  }
+
+  function renderJobsCell(j, col) {
+    const jobId = j.jobId || '';
+    const pendingApprovalCount = Number(j.pendingApprovalCount) || 0;
+    const canApprove = pendingApprovalCount > 0;
+    const checked = selectedJobIds.has(jobId) ? 'checked' : '';
+    const disabled = canApprove ? '' : 'disabled';
+    switch (col.key) {
+      case 'select':
+        return `<td class="select-cell"><input class="job-select" type="checkbox" data-job-id="${esc(jobId)}" ${checked} ${disabled} aria-label="Select job ${esc(jobId.slice(0, 8))}" /></td>`;
+      case 'created_at': return `<td>${esc(j.createdAt)}</td>`;
+      case 'job_id': return `<td><code title="${esc(jobId)}">${esc(jobId.slice(0, 8))}</code></td>`;
+      case 'kind': return `<td>${esc(j.kind)}</td>`;
+      case 'caller': return `<td>${esc(j.caller)}</td>`;
+      case 'asin': return `<td><code>${esc(j.asin || '')}</code></td>`;
+      case 'item_number': return `<td><code>${esc(j.itemNumber || '')}</code></td>`;
+      case 'marketplace_code': return `<td>${esc(j.marketplaceCode || '')}</td>`;
+      case 'label': return `<td>${esc(j.label || '')}</td>`;
+      case 'fields': return `<td>${fieldsCellHtml(j)}</td>`;
+      case 'ok_count': return `<td>${esc(j.okCount)}</td>`;
+      case 'failed_count': return `<td>${esc(j.failedCount)}</td>`;
+      case 'target_count': return `<td>${esc(j.targetCount)}</td>`;
+      case 'pending_approval': return `<td>${esc(pendingApprovalCount)}</td>`;
+      case 'status': return `<td>${statusBadge(j.status)}</td>`;
+      case 'requested_by': return `<td>${esc(j.requestedBy || '')}</td>`;
+      default: return '<td></td>';
+    }
+  }
+
+  function buildJobsTableHeader(cols) {
+    return cols.map((col) => {
+      if (col.key === 'select') {
+        return '<th class="select-cell no-resize" data-col="select"><input id="selectAllJobsRows" type="checkbox" aria-label="Select all approvable jobs" /></th>';
+      }
+      const sortActive = jobsColState.sortField === col.key;
+      const filterSet = jobsColState.filters[col.key];
+      const filterActive = !!(filterSet && filterSet.size);
+      const extraCls = [
+        col.key === 'select' ? 'select-cell' : '',
+        col.sortable ? 'sortable-header' : '',
+        sortActive ? 'sort-active' : '',
+        col.fixed ? 'no-resize' : ''
+      ].filter(Boolean).join(' ');
+      const title = col.title ? ` title="${esc(col.title)}"` : '';
+      const drag = col.fixed ? '' : ' draggable="true"';
+      const inner = (col.sortable || col.filterable)
+        ? colFilter.headerCell({
+          label: col.label,
+          sortable: col.sortable,
+          filterable: col.filterable,
+          sortActive,
+          sortDir: jobsColState.sortDir,
+          filterActive,
+          filterCount: filterActive ? filterSet.size : 0
+        })
+        : esc(col.label);
+      return `<th class="${extraCls}" data-col="${esc(col.key)}"${title}${drag}>${inner}</th>`;
+    }).join('');
+  }
+
+  function renderJobsColumnFiltersBar() {
+    const bar = $('#jobsColumnFiltersBar');
+    const text = $('#jobsColumnFiltersBarText');
+    if (!bar || !text) return;
+    const active = Object.entries(jobsColState.filters).filter(([, set]) => set && set.size);
+    if (!active.length) {
+      bar.classList.add('hidden');
+      return;
+    }
+    const labels = active.map(([key]) => {
+      const def = JOBS_COLUMN_DEFS.find((c) => c.key === key);
+      return def ? def.label : key;
+    });
+    text.textContent = `Column filters active: ${labels.join(', ')} (${active.length})`;
+    bar.classList.remove('hidden');
+  }
+
+  function wireJobsTableHeaders(table, cols) {
+    table.querySelectorAll('th[data-col]').forEach((th) => {
+      const key = th.dataset.col;
+      const col = cols.find((c) => c.key === key);
+      if (!col) return;
+      const sortEl = th.querySelector('[data-action="sort"]');
+      if (sortEl) {
+        sortEl.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (jobsColState.sortField === key) {
+            jobsColState.sortDir = jobsColState.sortDir === 'asc' ? 'desc' : 'asc';
+          } else {
+            jobsColState.sortField = key;
+            jobsColState.sortDir = 'asc';
+          }
+          saveJobsSort();
+          jobsPageState.page = 1;
+          renderJobsTable();
+        });
+      }
+      const filterEl = th.querySelector('[data-action="filter"]');
+      if (filterEl) {
+        filterEl.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openJobsColumnFilter(key, filterEl);
+        });
+      }
+      if (!col.fixed) {
+        columnUi.wireColumnDrag(th, {
+          canDrag: (el) => el.dataset.col !== 'select',
+          onReorder: (srcKey, targetKey, insertBefore) => {
+            applyJobsColumnReorder(srcKey, targetKey, insertBefore);
+          }
+        });
+      }
+    });
+    columnUi.enhanceResize(table);
+  }
+
+  function applyJobsColumnReorder(srcKey, targetKey, insertBefore) {
+    if (srcKey === 'select' || targetKey === 'select') return;
+    const visible = visibleJobsColumns().map((c) => c.key);
+    const full = fullJobsColumnOrder();
+    const hidden = full.filter((k) => !visible.includes(k));
+    const order = visible.filter((k) => k !== 'select');
+    const from = order.indexOf(srcKey);
+    if (from < 0) return;
+    order.splice(from, 1);
+    let to = order.indexOf(targetKey);
+    if (to < 0) return;
+    if (!insertBefore) to++;
+    order.splice(to, 0, srcKey);
+    jobsColState.order = ['select', ...order].concat(hidden.filter((k) => k !== 'select'));
+    saveJobsOrder();
+    renderJobsTable();
+  }
+
+  function openJobsColumnFilter(key, anchor) {
+    const col = JOBS_COLUMN_DEFS.find((c) => c.key === key);
+    if (!col) return;
+    const counts = new Map();
+    if (key === 'fields') {
+      for (const j of jobsDisplayItems) {
+        for (const name of jobFieldNames(j)) {
+          counts.set(name, (counts.get(name) || 0) + 1);
+        }
+      }
+    } else {
+      for (const j of jobsDisplayItems) {
+        const label = jobFilterValue(j, key);
+        const v = label === '' ? '' : String(label);
+        counts.set(v, (counts.get(v) || 0) + 1);
+      }
+    }
+    const values = [...counts.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+      .map(([value, count]) => ({ value, count }));
+    const current = jobsColState.filters[key] || new Set();
+    colFilter.open(anchor, {
+      label: col.label,
+      values,
+      selected: current,
+      onApply: (next) => {
+        if (next.size) jobsColState.filters[key] = next;
+        else delete jobsColState.filters[key];
+        saveJobsFilters();
+        jobsPageState.page = 1;
+        renderJobsTable();
+      },
+      onReset: () => {
+        delete jobsColState.filters[key];
+        saveJobsFilters();
+        jobsPageState.page = 1;
+        renderJobsTable();
+      }
+    });
+  }
+
+  function clearAllJobsColumnFilters() {
+    jobsColState.filters = {};
+    saveJobsFilters();
+    jobsPageState.page = 1;
+    renderJobsTable();
+  }
+
+  function buildJobsColSelectorList() {
+    const list = $('#jobsColSelectorList');
+    if (!list) return;
+    const widths = (() => {
+      try { return JSON.parse(localStorage.getItem('aps_jobs_col_widths') || '{}'); }
+      catch { return {}; }
+    })();
+    list.innerHTML = fullJobsColumnOrder().map((key) => {
+      const col = JOBS_COLUMN_DEFS.find((c) => c.key === key);
+      if (!col || !col.label) return '';
+      const checked = !jobsColState.hidden.has(key);
+      const w = widths[key];
+      const widthBadge = w ? `<span class="col-width">${Math.round(w)}px</span>` : '';
+      if (col.nohide) {
+        return `<div class="col-selector-item fixed-col"><input type="checkbox" checked disabled /><span class="col-selector-item-label">${esc(col.label)}</span>${widthBadge}</div>`;
+      }
+      return `<label class="col-selector-item"><input type="checkbox" data-col-key="${esc(key)}" ${checked ? 'checked' : ''} /><span class="col-selector-item-label">${esc(col.label)}</span>${widthBadge}</label>`;
+    }).join('');
+    list.querySelectorAll('input[data-col-key]').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const k = cb.dataset.colKey;
+        if (cb.checked) jobsColState.hidden.delete(k);
+        else jobsColState.hidden.add(k);
+        saveJobsHidden();
+        renderJobsTable();
+      });
+    });
+    const panel = $('#jobsColSelectorPanel');
+    if (panel) columnUi.reapplyColSelectorSearch(panel);
+  }
+
+  let jobsColSelectorOpen = false;
+  function openJobsColSelector() {
+    const panel = $('#jobsColSelectorPanel');
+    const overlay = $('#jobsColSelectorOverlay');
+    const btn = $('#jobsColSelectorBtn');
+    if (!panel || !overlay || !btn) return;
+    buildJobsColSelectorList();
+    panel.classList.add('open');
+    overlay.classList.add('open');
+    btn.classList.add('active');
+    btn.setAttribute('aria-expanded', 'true');
+    jobsColSelectorOpen = true;
+    columnUi.initColSelectorSearch(panel);
+  }
+  function closeJobsColSelector() {
+    const panel = $('#jobsColSelectorPanel');
+    const overlay = $('#jobsColSelectorOverlay');
+    const btn = $('#jobsColSelectorBtn');
+    if (!panel) return;
+    columnUi.clearColSelectorSearch(panel);
+    panel.classList.remove('open');
+    if (overlay) overlay.classList.remove('open');
+    if (btn) {
+      btn.classList.remove('active');
+      btn.setAttribute('aria-expanded', 'false');
+    }
+    jobsColSelectorOpen = false;
+  }
+  function toggleJobsColSelector() {
+    if (jobsColSelectorOpen) closeJobsColSelector();
+    else openJobsColSelector();
+  }
+  function resetJobsColumns() {
+    jobsColState.hidden = new Set(['item_number', 'marketplace_code', 'label', 'requested_by']);
+    jobsColState.order = [];
+    jobsColState.sortField = 'created_at';
+    jobsColState.sortDir = 'desc';
+    jobsColState.filters = {};
+    saveJobsHidden();
+    saveJobsOrder();
+    saveJobsSort();
+    saveJobsFilters();
+    jobsPageState.page = 1;
+    const table = $('#jobsTable');
+    if (table) columnUi.resetResize(table);
+    renderJobsTable();
+  }
+
+  function renderJobsPagination({ total, start, shown, pageCount }) {
+    const bar = $('#jobsPagination');
+    if (!bar) return;
+    if (!total) { bar.classList.add('hidden'); return; }
+    bar.classList.remove('hidden');
+    const sizeSel = $('#jobsPageSize');
+    if (sizeSel && Number(sizeSel.value) !== jobsPageState.pageSize) {
+      sizeSel.value = String(jobsPageState.pageSize);
+    }
+    const info = $('#jobsPaginationInfo');
+    if (info) {
+      const from = total ? start + 1 : 0;
+      const to = start + shown;
+      const capNote = jobsPageState.fetchCapped
+        ? ` <span class="pagination-cap" title="Showing the ${JOBS_MAX_ROWS.toLocaleString()} most recent jobs; older ones are not loaded.">(most recent ${JOBS_MAX_ROWS.toLocaleString()} loaded)</span>`
+        : '';
+      info.innerHTML = `Showing <strong>${from.toLocaleString()}–${to.toLocaleString()}</strong> of <strong>${total.toLocaleString()}</strong>${capNote}`;
+    }
+    const indicator = $('#jobsPageIndicator');
+    if (indicator) indicator.textContent = `Page ${jobsPageState.page} of ${pageCount}`;
+    const atFirst = jobsPageState.page <= 1;
+    const atLast = jobsPageState.page >= pageCount;
+    const first = $('#jobsPageFirst');
+    const prev = $('#jobsPagePrev');
+    const next = $('#jobsPageNext');
+    const last = $('#jobsPageLast');
+    if (first) first.disabled = atFirst;
+    if (prev) prev.disabled = atFirst;
+    if (next) next.disabled = atLast;
+    if (last) last.disabled = atLast;
+  }
+
+  function goToJobsPage(page) {
+    const next = Number(page);
+    if (!Number.isFinite(next)) return;
+    jobsPageState.page = Math.max(1, Math.round(next));
+    renderJobsTable();
+  }
+
+  function renderJobsTable() {
+    const table = $('#jobsTable');
+    const thead = table && table.querySelector('thead tr');
+    const tbody = table && table.querySelector('tbody');
+    if (!table || !thead || !tbody) return;
+    const cols = visibleJobsColumns();
+    const colCount = cols.length;
+    thead.innerHTML = buildJobsTableHeader(cols);
+    const filtered = applyJobsFiltersAndSort(jobsDisplayItems);
+    const total = filtered.length;
+    const pageSize = jobsPageState.pageSize;
+    const pageCount = Math.max(1, Math.ceil(total / pageSize));
+    if (jobsPageState.page > pageCount) jobsPageState.page = pageCount;
+    if (jobsPageState.page < 1) jobsPageState.page = 1;
+    const start = (jobsPageState.page - 1) * pageSize;
+    const pageItems = filtered.slice(start, start + pageSize);
+    const approvable = new Set(filtered.filter((j) => Number(j.pendingApprovalCount) > 0).map((j) => j.jobId));
+    for (const id of [...selectedJobIds]) {
+      if (!approvable.has(id)) selectedJobIds.delete(id);
+    }
+    if (!total) {
+      const msg = jobsDisplayItems.length
+        ? 'No rows match the current column filters.'
+        : 'No rows.';
+      tbody.innerHTML = `<tr><td colspan="${colCount}" style="text-align:center;color:var(--text-muted);padding:20px;">${msg}</td></tr>`;
+    } else {
+      tbody.innerHTML = pageItems.map((j) => {
+        const jobId = j.jobId || '';
+        return `<tr data-job-id="${esc(jobId)}">${cols.map((col) => renderJobsCell(j, col)).join('')}</tr>`;
+      }).join('');
+    }
+    renderJobsColumnFiltersBar();
+    renderJobsPagination({ total, start, shown: pageItems.length, pageCount });
+    wireJobsTableHeaders(table, cols);
+    if (jobsColSelectorOpen) buildJobsColSelectorList();
+    syncJobSelectionControls();
+  }
+
   async function loadJobs() {
     const tbody = $('#jobsTable tbody');
+    const searchEl = $('#jobsSearch');
+    const statusEl = $('#jobsSearchStatus');
+    const exportLink = $('#jobsExportLink');
+    const search = searchEl ? searchEl.value.trim() : '';
+    const exportQs = new URLSearchParams({ token });
+    if (search) exportQs.set('search', search);
+    if (exportLink) {
+      exportLink.href = `/admin/jobs/export?${exportQs.toString()}`;
+      exportLink.classList.remove('disabled');
+    }
     try {
-      const { jobs } = await api('/admin/jobs');
-      const approvable = new Set(jobs.filter((j) => Number(j.pendingApprovalCount) > 0).map((j) => j.jobId));
-      for (const id of [...selectedJobIds]) {
-        if (!approvable.has(id)) selectedJobIds.delete(id);
+      const jobs = [];
+      let beforeId = null;
+      let total = Infinity;
+      for (let guard = 0; jobs.length < JOBS_MAX_ROWS && guard < 1000; guard++) {
+        const params = new URLSearchParams();
+        params.set('limit', String(JOBS_FETCH_LIMIT));
+        if (search) params.set('search', search);
+        if (beforeId != null) params.set('beforeId', String(beforeId));
+        const data = await api('/admin/jobs?' + params.toString());
+        const batch = Array.isArray(data.jobs) ? data.jobs : [];
+        if (typeof data.total === 'number') total = data.total;
+        jobs.push(...batch);
+        if (!data.nextBeforeId || batch.length < JOBS_FETCH_LIMIT) break;
+        beforeId = data.nextBeforeId;
       }
-      tbody.innerHTML = jobs.map((j) => {
-        const jobId = j.jobId || '';
-        const pendingApprovalCount = Number(j.pendingApprovalCount) || 0;
-        const canApprove = pendingApprovalCount > 0;
-        const checked = selectedJobIds.has(jobId) ? 'checked' : '';
-        const disabled = canApprove ? '' : 'disabled';
-        return `<tr data-job-id="${esc(jobId)}">
-        <td class="select-cell"><input class="job-select" type="checkbox" data-job-id="${esc(jobId)}" ${checked} ${disabled} aria-label="Select job ${esc(jobId.slice(0, 8))}" /></td>
-        <td>${esc(j.createdAt)}</td><td><code title="${esc(jobId)}">${esc(jobId.slice(0, 8))}</code></td>
-        <td>${esc(j.kind)}</td><td>${esc(j.caller)}</td><td>${esc(j.asin || '')}</td>
-        <td>${esc(j.okCount)}</td><td>${esc(j.failedCount)}</td><td>${esc(j.targetCount)}</td>
-        <td>${esc(pendingApprovalCount)}</td><td>${statusBadge(j.status)}</td></tr>`;
-      }).join('') || emptyRow(JOB_COLS);
-      syncJobSelectionControls();
-    } catch (e) { if (e.message !== '401') tbody.innerHTML = errRow(JOB_COLS, e); }
+      jobsPageState.fetchCapped = Number.isFinite(total) && jobs.length < total;
+      jobsDisplayItems = jobs;
+      jobsPageState.page = 1;
+      if (statusEl) {
+        const filteredCount = applyJobsFiltersAndSort(jobs).length;
+        if (search) {
+          const loaded = jobs.length;
+          if (!loaded) statusEl.textContent = 'No matches';
+          else if (jobsPageState.fetchCapped) {
+            statusEl.textContent = `${loaded.toLocaleString()} of ${total.toLocaleString()} matches loaded${filteredCount !== loaded ? ` (${filteredCount.toLocaleString()} after column filters)` : ''}`;
+          } else {
+            const suffix = filteredCount !== loaded ? ` (${filteredCount.toLocaleString()} after column filters)` : '';
+            statusEl.textContent = `${loaded.toLocaleString()} match${loaded === 1 ? '' : 'es'}${suffix}`;
+          }
+        } else {
+          statusEl.textContent = jobs.length
+            ? `${filteredCount.toLocaleString()} job${filteredCount === 1 ? '' : 's'}${filteredCount !== jobs.length ? ` of ${jobs.length.toLocaleString()} loaded` : ''}`
+            : '';
+        }
+      }
+      if (exportLink) exportLink.classList.toggle('disabled', !jobs.length);
+      renderJobsTable();
+    } catch (e) {
+      if (e.message !== '401') {
+        const n = visibleJobsColCount() || JOBS_COL_KEYS.length;
+        tbody.innerHTML = errRow(n, e);
+        const bar = $('#jobsPagination');
+        if (bar) bar.classList.add('hidden');
+      }
+      if (exportLink) exportLink.classList.add('disabled');
+    }
   }
 
   function syncJobSelectionControls() {
     const boxes = Array.from(document.querySelectorAll('#jobsTable tbody input.job-select:not(:disabled)'));
     const selectedCount = [...selectedJobIds].length;
-    const selectAll = $('#selectAllJobs');
+    const selectAll = $('#selectAllJobsRows');
     const approveBtn = $('#approveSelectedJobs');
     if (selectAll) {
       selectAll.disabled = jobBulkBusy || boxes.length === 0;
@@ -1429,6 +2034,11 @@
 
   function aiActionCell(r) {
     if (!resolverEnabled) return '<span class="muted-cell">—</span>';
+    // Archived errors are excluded from AI assessment: show the state, not a
+    // review action (unless a fix was already applied before archiving).
+    if (r.archived && !(r.aiResolution && r.aiResolution.status === 'APPLIED')) {
+      return '<span class="muted-cell" title="Archived — AI fixes are not assessed">Archived</span>';
+    }
     const rs = r.aiResolution;
     const label = rs ? (rs.status === 'APPLIED' ? 'View fix' : 'Review fix') : 'Review &amp; fix (AI)';
     const badge = aiBadge(rs);
@@ -1438,8 +2048,401 @@
     </div>`;
   }
 
+  // Archive toggle for one error. Archiving excludes the row from AI review
+  // (single and "Review all"); the row stays visible, marked archived.
+  function archiveCell(r) {
+    const label = r.archived ? 'Unarchive' : 'Archive';
+    const title = r.archived
+      ? `Archived${r.archived_by ? ' by ' + r.archived_by : ''} — click to re-enable AI fixes`
+      : 'Archive this error so no AI fixes are assessed';
+    return `<button class="btn-ghost ai-archive-btn" data-uuid="${esc(r.submission_uuid)}" data-archived="${r.archived ? '1' : '0'}" title="${esc(title)}">${label}</button>`;
+  }
+
+  // ── Errors table columns (sort / filter — Battat funnel pattern) ─────────
+  // Sort + per-value column filters, persisted to localStorage, applied
+  // client-side over the full error set before rendering. The select / details
+  // / AI fix / archive columns are fixed action columns (not sortable/filterable).
+  const ERROR_COLUMN_DEFS = [
+    { key: 'select', label: '', fixed: true, sortable: false, filterable: false },
+    { key: 'created_at', label: 'Created', sortable: true, filterable: true },
+    { key: 'status', label: 'Status', sortable: true, filterable: true },
+    { key: 'asin', label: 'ASIN', sortable: true, filterable: true },
+    { key: 'sku', label: 'SKU', sortable: true, filterable: true },
+    { key: 'marketplace_code', label: 'Mkt', sortable: true, filterable: true },
+    { key: 'codes', label: 'Codes', sortable: true, filterable: true },
+    { key: 'message', label: 'Message', sortable: true, filterable: true },
+    { key: 'details', label: 'Details', fixed: true, sortable: false, filterable: false },
+    { key: 'retry', label: 'Retry', fixed: true, sortable: false, filterable: false },
+    { key: 'aifix', label: 'AI fix', fixed: true, sortable: false, filterable: false },
+    { key: 'archive', label: 'Archive', fixed: true, sortable: false, filterable: false }
+  ];
+  const ERROR_COL_KEYS = ERROR_COLUMN_DEFS.map((c) => c.key);
+  const ERROR_STORAGE = { sort: 'aps_errors_sort', filters: 'aps_errors_col_filters' };
+  const errorColState = { sortField: 'created_at', sortDir: 'desc', filters: {} };
+  let errorRecords = [];
+  let errorsView = 'active';
+  const ERROR_VIEW_STORAGE = 'aps_errors_view';
+  const ERROR_PAGE_SIZES = [50, 100, 200, 500, 1000];
+  const ERROR_PAGE_STORAGE = 'aps_errors_page_size';
+  const errorPageState = { page: 1, pageSize: 200 };
+
+  function loadErrorsView() {
+    try {
+      const v = localStorage.getItem(ERROR_VIEW_STORAGE);
+      if (v === 'archived' || v === 'active') errorsView = v;
+    } catch (_) { /* default active */ }
+  }
+  function loadErrorPageSize() {
+    try {
+      const saved = Number(localStorage.getItem(ERROR_PAGE_STORAGE));
+      if (ERROR_PAGE_SIZES.includes(saved)) errorPageState.pageSize = saved;
+    } catch (_) { /* default */ }
+  }
+  function saveErrorPageSize() {
+    try { localStorage.setItem(ERROR_PAGE_STORAGE, String(errorPageState.pageSize)); } catch (_) {}
+  }
+  function errorsForCurrentView() {
+    const wantArchived = errorsView === 'archived';
+    return errorRecords.filter((r) => (wantArchived ? !!r.archived : !r.archived));
+  }
+  function errorViewCounts() {
+    let active = 0; let archived = 0;
+    for (const r of errorRecords) {
+      if (r.archived) archived++; else active++;
+    }
+    return { active, archived };
+  }
+
+  function updateErrorsCountLabel() {
+    const { active, archived } = errorViewCounts();
+    const countEl = $('#errorsCount');
+    if (!countEl) return;
+    const n = errorsView === 'archived' ? archived : active;
+    const label = errorsView === 'archived' ? 'archived error' : 'active error';
+    countEl.textContent = n
+      ? `${n} ${label}${n === 1 ? '' : 's'}`
+      : (errorsView === 'archived' ? 'No archived errors' : 'No active errors');
+  }
+
+  function loadErrorColState() {
+    try {
+      const sort = JSON.parse(localStorage.getItem(ERROR_STORAGE.sort) || '{}');
+      if (sort.field && ERROR_COL_KEYS.includes(sort.field)) {
+        errorColState.sortField = sort.field;
+        errorColState.sortDir = sort.dir === 'asc' ? 'asc' : 'desc';
+      }
+    } catch (_) { /* defaults */ }
+    try {
+      const filters = JSON.parse(localStorage.getItem(ERROR_STORAGE.filters) || '{}');
+      errorColState.filters = {};
+      for (const [k, vals] of Object.entries(filters)) {
+        if (ERROR_COL_KEYS.includes(k) && Array.isArray(vals) && vals.length) {
+          errorColState.filters[k] = new Set(vals.map(String));
+        }
+      }
+    } catch (_) { errorColState.filters = {}; }
+  }
+  function saveErrorSort() {
+    try { localStorage.setItem(ERROR_STORAGE.sort, JSON.stringify({ field: errorColState.sortField, dir: errorColState.sortDir })); } catch (_) {}
+  }
+  function saveErrorFilters() {
+    const out = {};
+    for (const [k, set] of Object.entries(errorColState.filters)) if (set && set.size) out[k] = [...set];
+    try { localStorage.setItem(ERROR_STORAGE.filters, JSON.stringify(out)); } catch (_) {}
+  }
+
+  // Canonical value used for both filtering (exact match) and grouping.
+  function errorFilterValue(r, key) {
+    switch (key) {
+      case 'created_at': return r.created_at || '';
+      case 'codes': return errorCodes(r);
+      case 'message': {
+        const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
+        return r.error_message || (details[0] ? formatErrorDetail(details[0]) : '');
+      }
+      default: return r[key] == null ? '' : String(r[key]);
+    }
+  }
+  function errorSortValue(r, key) {
+    const raw = errorFilterValue(r, key);
+    if (key === 'created_at') return raw; // ISO-ish strings sort lexically
+    return String(raw).toLowerCase();
+  }
+  function applyErrorFiltersAndSort(records) {
+    let rows = records.slice();
+    for (const [key, allowed] of Object.entries(errorColState.filters)) {
+      if (!allowed || !allowed.size) continue;
+      rows = rows.filter((r) => allowed.has(errorFilterValue(r, key)));
+    }
+    const field = errorColState.sortField;
+    const dir = errorColState.sortDir === 'asc' ? 1 : -1;
+    if (field && ERROR_COL_KEYS.includes(field)) {
+      rows.sort((a, b) => {
+        const av = errorSortValue(a, field);
+        const bv = errorSortValue(b, field);
+        if (av < bv) return -1 * dir;
+        if (av > bv) return 1 * dir;
+        return 0;
+      });
+    }
+    return rows;
+  }
+
+  function buildErrorsTableHeader() {
+    return ERROR_COLUMN_DEFS.map((col) => {
+      if (col.key === 'select') {
+        return '<th class="select-cell no-resize" data-col="select"><input id="selectAllErrors" type="checkbox" aria-label="Select all visible errors" /></th>';
+      }
+      const sortActive = errorColState.sortField === col.key;
+      const filterSet = errorColState.filters[col.key];
+      const filterActive = !!(filterSet && filterSet.size);
+      const extraCls = [col.sortable ? 'sortable-header' : '', sortActive ? 'sort-active' : ''].filter(Boolean).join(' ');
+      const inner = (col.sortable || col.filterable)
+        ? colFilter.headerCell({
+          label: col.label,
+          sortable: col.sortable,
+          filterable: col.filterable,
+          sortActive,
+          sortDir: errorColState.sortDir,
+          filterActive,
+          filterCount: filterActive ? filterSet.size : 0
+        })
+        : esc(col.label);
+      return `<th class="${extraCls}" data-col="${esc(col.key)}">${inner}</th>`;
+    }).join('');
+  }
+
+  function renderErrorCell(r, col) {
+    switch (col.key) {
+      case 'select': {
+        const checked = selectedErrorUuids.has(r.submission_uuid) ? 'checked' : '';
+        return `<td class="select-cell"><input class="error-select" type="checkbox" data-uuid="${esc(r.submission_uuid)}" ${checked} aria-label="Select error ${esc(r.submission_uuid.slice(0, 8))}" /></td>`;
+      }
+      case 'created_at': return `<td>${esc(r.created_at || '')}</td>`;
+      case 'status': return `<td>${statusBadge(r.status)}</td>`;
+      case 'asin': return `<td>${esc(r.asin || '')}</td>`;
+      case 'sku': return `<td>${esc(r.sku || '')}</td>`;
+      case 'marketplace_code': return `<td>${esc(r.marketplace_code || '')}</td>`;
+      case 'codes': return `<td>${esc(errorCodes(r))}</td>`;
+      case 'message': {
+        const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
+        const msg = r.error_message || (details[0] ? formatErrorDetail(details[0]) : '');
+        return `<td>${esc(msg)}</td>`;
+      }
+      case 'details': {
+        const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
+        const issueLines = details.map(formatErrorDetail).filter(Boolean).join('\n');
+        let raw = '';
+        if (r.rawResponse) {
+          try { raw = JSON.stringify(JSON.parse(r.rawResponse), null, 2); } catch (_) { raw = r.rawResponse; }
+        }
+        const detailText = [issueLines, raw ? '--- Raw Amazon response ---\n' + raw : ''].filter(Boolean).join('\n\n');
+        return `<td>${detailText ? `<details><summary>view</summary><pre>${esc(detailText)}</pre></details>` : ''}</td>`;
+      }
+      case 'aifix': return `<td>${aiActionCell(r)}</td>`;
+      case 'retry': {
+        const retryable = r.status === 'FAILED' || r.status === 'BLOCKED';
+        if (!retryable) return '<td></td>';
+        return `<td><button class="btn-ghost error-retry-btn" data-uuid="${esc(r.submission_uuid)}" title="Re-submit the same package to Amazon">Retry</button></td>`;
+      }
+      case 'archive': return `<td>${archiveCell(r)}</td>`;
+      default: return '<td></td>';
+    }
+  }
+
+  function wireErrorsTableHeaders(table) {
+    table.querySelectorAll('th[data-col]').forEach((th) => {
+      const key = th.dataset.col;
+      const col = ERROR_COLUMN_DEFS.find((c) => c.key === key);
+      if (!col) return;
+      const sortEl = th.querySelector('[data-action="sort"]');
+      if (sortEl) {
+        sortEl.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (errorColState.sortField === key) {
+            errorColState.sortDir = errorColState.sortDir === 'asc' ? 'desc' : 'asc';
+          } else {
+            errorColState.sortField = key;
+            errorColState.sortDir = 'asc';
+          }
+          saveErrorSort();
+          errorPageState.page = 1;
+          renderErrorsTable();
+        });
+      }
+      const filterEl = th.querySelector('[data-action="filter"]');
+      if (filterEl) {
+        filterEl.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openErrorColumnFilter(key, filterEl);
+        });
+      }
+    });
+  }
+
+  function openErrorColumnFilter(key, anchor) {
+    const col = ERROR_COLUMN_DEFS.find((c) => c.key === key);
+    if (!col) return;
+    const counts = new Map();
+    for (const r of errorsForCurrentView()) {
+      const v = String(errorFilterValue(r, key));
+      counts.set(v, (counts.get(v) || 0) + 1);
+    }
+    const values = [...counts.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+      .map(([value, count]) => ({ value, count }));
+    const current = errorColState.filters[key] || new Set();
+    colFilter.open(anchor, {
+      label: col.label,
+      values,
+      selected: current,
+      onApply: (next) => {
+        if (next.size) errorColState.filters[key] = next;
+        else delete errorColState.filters[key];
+        saveErrorFilters();
+        errorPageState.page = 1;
+        renderErrorsTable();
+      },
+      onReset: () => {
+        delete errorColState.filters[key];
+        saveErrorFilters();
+        errorPageState.page = 1;
+        renderErrorsTable();
+      }
+    });
+  }
+
+  function clearAllErrorColumnFilters() {
+    errorColState.filters = {};
+    saveErrorFilters();
+    errorPageState.page = 1;
+    renderErrorsTable();
+  }
+
+  function renderErrorsColumnFiltersBar(shown, total, viewTotal) {
+    const bar = $('#errorsColumnFiltersBar');
+    const text = $('#errorsColumnFiltersBarText');
+    if (!bar || !text) return;
+    const active = Object.entries(errorColState.filters).filter(([, set]) => set && set.size);
+    if (!active.length) { bar.classList.add('hidden'); return; }
+    const labels = active.map(([key]) => {
+      const def = ERROR_COLUMN_DEFS.find((c) => c.key === key);
+      return def ? def.label : key;
+    });
+    const viewLabel = errorsView === 'archived' ? 'archived' : 'active';
+    text.textContent = `Column filters active: ${labels.join(', ')} — showing ${shown} of ${total} ${viewLabel} (${viewTotal} total)`;
+    bar.classList.remove('hidden');
+  }
+
+  function renderErrorsPagination({ total, start, shown, pageCount }) {
+    const bar = $('#errorsPagination');
+    if (!bar) return;
+    if (!total) { bar.classList.add('hidden'); return; }
+    bar.classList.remove('hidden');
+    const sizeSel = $('#errorsPageSize');
+    if (sizeSel && Number(sizeSel.value) !== errorPageState.pageSize) {
+      sizeSel.value = String(errorPageState.pageSize);
+    }
+    const info = $('#errorsPaginationInfo');
+    if (info) {
+      const from = total ? start + 1 : 0;
+      const to = start + shown;
+      info.innerHTML = `Showing <strong>${from.toLocaleString()}–${to.toLocaleString()}</strong> of <strong>${total.toLocaleString()}</strong>`;
+    }
+    const indicator = $('#errorsPageIndicator');
+    if (indicator) indicator.textContent = `Page ${errorPageState.page} of ${pageCount}`;
+    const atFirst = errorPageState.page <= 1;
+    const atLast = errorPageState.page >= pageCount;
+    const first = $('#errorsPageFirst');
+    const prev = $('#errorsPagePrev');
+    const next = $('#errorsPageNext');
+    const last = $('#errorsPageLast');
+    if (first) first.disabled = atFirst;
+    if (prev) prev.disabled = atFirst;
+    if (next) next.disabled = atLast;
+    if (last) last.disabled = atLast;
+  }
+
+  function goToErrorsPage(page) {
+    const next = Number(page);
+    if (!Number.isFinite(next)) return;
+    errorPageState.page = Math.max(1, Math.round(next));
+    renderErrorsTable();
+  }
+
+  function syncErrorsSubtabs() {
+    const { active, archived } = errorViewCounts();
+    document.querySelectorAll('#errorsSubtabs .view-subtab').forEach((btn) => {
+      const view = btn.dataset.errorsView;
+      btn.classList.toggle('active', view === errorsView);
+      if (view === 'active') btn.textContent = `Active (${active})`;
+      else if (view === 'archived') btn.textContent = `Archived (${archived})`;
+    });
+  }
+
+  function syncErrorsToolbarForView() {
+    const isArchived = errorsView === 'archived';
+    const archiveBtn = $('#archiveSelectedErrors');
+    const unarchiveBtn = $('#unarchiveSelectedErrors');
+    const reviewBtn = $('#reviewSelectedErrors');
+    const reviewAllBtn = $('#reviewAllErrors');
+    if (archiveBtn) archiveBtn.hidden = isArchived;
+    if (unarchiveBtn) unarchiveBtn.hidden = !isArchived;
+    if (reviewBtn) reviewBtn.hidden = !resolverEnabled || isArchived;
+    if (reviewAllBtn) reviewAllBtn.hidden = !resolverEnabled || isArchived;
+  }
+
+  function setErrorsView(view) {
+    if (view !== 'active' && view !== 'archived') return;
+    if (errorsView === view) return;
+    errorsView = view;
+    try { localStorage.setItem(ERROR_VIEW_STORAGE, view); } catch (_) {}
+    selectedErrorUuids.clear();
+    errorBulkMessage = '';
+    errorPageState.page = 1;
+    updateErrorsCountLabel();
+    syncErrorsSubtabs();
+    syncErrorsToolbarForView();
+    renderErrorsTable();
+  }
+
+  // Render the errors table from the in-memory record set (no refetch). Filter
+  // and sort run over the full active/archived view set client-side; only the
+  // slice for the current page is rendered.
+  function renderErrorsTable() {
+    const table = $('#errorsTable');
+    const thead = table && table.querySelector('thead tr');
+    const tbody = table && table.querySelector('tbody');
+    if (!table || !thead || !tbody) return;
+    thead.innerHTML = buildErrorsTableHeader();
+    wireErrorsTableHeaders(table);
+    const viewRecords = errorsForCurrentView();
+    const filtered = applyErrorFiltersAndSort(viewRecords);
+    const total = filtered.length;
+    const pageSize = errorPageState.pageSize;
+    const pageCount = Math.max(1, Math.ceil(total / pageSize));
+    if (errorPageState.page > pageCount) errorPageState.page = pageCount;
+    if (errorPageState.page < 1) errorPageState.page = 1;
+    const start = (errorPageState.page - 1) * pageSize;
+    const pageRows = filtered.slice(start, start + pageSize);
+    const colCount = ERROR_COLUMN_DEFS.length;
+    if (!total) {
+      const msg = viewRecords.length
+        ? 'No rows match the current column filters.'
+        : (errorsView === 'archived' ? 'No archived errors.' : 'No active errors.');
+      tbody.innerHTML = `<tr><td colspan="${colCount}" style="text-align:center;color:var(--text-muted);padding:20px;">${msg}</td></tr>`;
+    } else {
+      tbody.innerHTML = pageRows.map((r) =>
+        `<tr data-uuid="${esc(r.submission_uuid)}">${ERROR_COLUMN_DEFS.map((col) => renderErrorCell(r, col)).join('')}</tr>`
+      ).join('');
+    }
+    renderErrorsColumnFiltersBar(pageRows.length, total, viewRecords.length);
+    renderErrorsPagination({ total, start, shown: pageRows.length, pageCount });
+    syncErrorsSubtabs();
+    syncErrorSelectionControls();
+  }
+
   async function loadErrors() {
-    const tbody = $('#errorsTable tbody');
     const link = $('#errorsExportLink');
     if (link) link.href = `/admin/errors/export?token=${encodeURIComponent(token)}`;
     try {
@@ -1448,34 +2451,75 @@
       resolverEnabled = !!resp.resolverEnabled;
       const reviewAllBtn = $('#reviewAllErrors');
       if (reviewAllBtn) reviewAllBtn.hidden = !resolverEnabled;
+      errorRecords = Array.isArray(errors) ? errors : [];
       errorsByUuid.clear();
-      errors.forEach((r) => errorsByUuid.set(r.submission_uuid, r));
-      const countEl = $('#errorsCount');
-      if (countEl) countEl.textContent = count ? `${count} submission${count === 1 ? '' : 's'} with errors` : 'No errors';
+      errorRecords.forEach((r) => errorsByUuid.set(r.submission_uuid, r));
+      updateErrorsCountLabel();
       if (link) link.classList.toggle('disabled', !count);
-      tbody.innerHTML = errors.map((r) => {
-        const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
-        const codes = errorCodes(r);
-        const msg = r.error_message || (details[0] ? formatErrorDetail(details[0]) : '');
-        const issueLines = details.map(formatErrorDetail).filter(Boolean).join('\n');
-        let raw = '';
-        if (r.rawResponse) {
-          try { raw = JSON.stringify(JSON.parse(r.rawResponse), null, 2); } catch (_) { raw = r.rawResponse; }
-        }
-        const detailText = [issueLines, raw ? '--- Raw Amazon response ---\n' + raw : ''].filter(Boolean).join('\n\n');
-        const detailCell = detailText ? `<details><summary>view</summary><pre>${esc(detailText)}</pre></details>` : '';
-        return `<tr data-uuid="${esc(r.submission_uuid)}">
-          <td>${esc(r.created_at || '')}</td>
-          <td>${statusBadge(r.status)}</td>
-          <td>${esc(r.asin || '')}</td>
-          <td>${esc(r.sku || '')}</td>
-          <td>${esc(r.marketplace_code || '')}</td>
-          <td>${esc(codes)}</td>
-          <td>${esc(msg)}</td>
-          <td>${detailCell}</td>
-          <td>${aiActionCell(r)}</td></tr>`;
-      }).join('') || emptyRow(9);
-    } catch (e) { if (e.message !== '401') tbody.innerHTML = errRow(9, e); }
+      errorPageState.page = 1;
+      syncErrorsSubtabs();
+      syncErrorsToolbarForView();
+      renderErrorsTable();
+    } catch (e) {
+      if (e.message === '401') return;
+      const tbody = $('#errorsTable tbody');
+      if (tbody) tbody.innerHTML = errRow(ERROR_COLUMN_DEFS.length, e);
+    }
+  }
+
+  // Reflect the current error selection on the toolbar controls. Archive and
+  // Review act on the *active* (un-archived) subset of the selection; Unarchive
+  // acts on the archived subset — so a mixed selection enables the right
+  // buttons. Prunes selections whose rows are no longer present.
+  function syncErrorSelectionControls() {
+    const boxes = Array.from(document.querySelectorAll('#errorsTable tbody input.error-select'));
+    const present = new Set(boxes.map((b) => b.dataset.uuid));
+    const viewUuids = new Set(errorsForCurrentView().map((r) => r.submission_uuid));
+    for (const u of [...selectedErrorUuids]) {
+      if (!present.has(u) || !viewUuids.has(u)) selectedErrorUuids.delete(u);
+    }
+
+    let selArchived = 0; let selActive = 0;
+    for (const u of selectedErrorUuids) {
+      const rec = errorsByUuid.get(u);
+      if (rec && rec.archived) selArchived++; else selActive++;
+    }
+    const selectedCount = selectedErrorUuids.size;
+
+    const selectAll = $('#selectAllErrors');
+    if (selectAll) {
+      selectAll.disabled = errorBulkBusy || boxes.length === 0;
+      selectAll.checked = boxes.length > 0 && boxes.every((cb) => selectedErrorUuids.has(cb.dataset.uuid));
+      selectAll.indeterminate = selectedCount > 0 && !selectAll.checked;
+    }
+    const archiveBtn = $('#archiveSelectedErrors');
+    if (archiveBtn) {
+      archiveBtn.disabled = errorBulkBusy || selActive === 0;
+      archiveBtn.textContent = selActive ? `Archive selected (${selActive})` : 'Archive selected';
+    }
+    const unarchiveBtn = $('#unarchiveSelectedErrors');
+    if (unarchiveBtn) {
+      unarchiveBtn.disabled = errorBulkBusy || selArchived === 0;
+      unarchiveBtn.textContent = selArchived ? `Unarchive selected (${selArchived})` : 'Unarchive selected';
+    }
+    const reviewBtn = $('#reviewSelectedErrors');
+    if (reviewBtn) {
+      reviewBtn.hidden = !resolverEnabled;
+      reviewBtn.disabled = errorBulkBusy || selActive === 0;
+      reviewBtn.textContent = selActive ? `Review selected (${selActive})` : 'Review selected (AI)';
+    }
+    const retryBtn = $('#retrySelectedErrors');
+    if (retryBtn) {
+      let selRetryable = 0;
+      for (const u of selectedErrorUuids) {
+        const rec = errorsByUuid.get(u);
+        if (rec && (rec.status === 'FAILED' || rec.status === 'BLOCKED')) selRetryable++;
+      }
+      retryBtn.disabled = errorBulkBusy || selRetryable === 0;
+      retryBtn.textContent = selRetryable ? `Retry selected (${selRetryable})` : 'Retry selected';
+    }
+    const status = $('#errorsBulkStatus');
+    if (status && !errorBulkBusy) status.textContent = selectedCount ? `${selectedCount} selected` : errorBulkMessage;
   }
 
   // ── AI error-resolution modal ────────────────────────────────────────────
@@ -1666,6 +2710,124 @@
     }
   }
 
+  async function toggleArchiveError(uuid, archived) {
+    try {
+      await apiPost(`/admin/errors/${encodeURIComponent(uuid)}/archive`, { archived });
+      await loadErrors();
+    } catch (err) {
+      if (err.message === '401') return;
+      alert('Could not update archive state: ' + err.message);
+    }
+  }
+
+  // Bulk archive (archived=true) or un-archive (archived=false) the relevant
+  // subset of the current selection.
+  async function bulkArchiveErrors(archived) {
+    if (errorBulkBusy) return;
+    const uuids = [...selectedErrorUuids].filter((u) => {
+      const rec = errorsByUuid.get(u);
+      return rec && (archived ? !rec.archived : rec.archived);
+    });
+    if (!uuids.length) return;
+    const verb = archived ? 'Archive' : 'Unarchive';
+    if (!confirm(`${verb} ${uuids.length} selected error${uuids.length === 1 ? '' : 's'}?${archived ? ' Archived errors are skipped by the AI resolver.' : ''}`)) return;
+    errorBulkBusy = true;
+    syncErrorSelectionControls();
+    const status = $('#errorsBulkStatus');
+    if (status) status.textContent = 'Working…';
+    try {
+      const out = await apiPost('/admin/errors/archive-batch', { uuids, archived });
+      selectedErrorUuids.clear();
+      errorBulkMessage = `${archived ? 'Archived' : 'Unarchived'} ${out.changed}${out.missing ? `, ${out.missing} missing` : ''}.`;
+      await loadErrors();
+      if (status) status.textContent = errorBulkMessage;
+    } catch (err) {
+      if (err.message === '401') return;
+      errorBulkMessage = `${verb} failed: ` + err.message;
+      if (status) status.textContent = errorBulkMessage;
+      alert(`${verb} selected failed: ` + err.message);
+    } finally {
+      errorBulkBusy = false;
+      syncErrorSelectionControls();
+    }
+  }
+
+  async function retryOneError(uuid) {
+    if (errorBulkBusy) return;
+    const rec = errorsByUuid.get(uuid);
+    if (!rec || (rec.status !== 'FAILED' && rec.status !== 'BLOCKED')) return;
+    const label = [rec.asin, rec.sku, rec.marketplace_code].filter(Boolean).join(' · ');
+    if (!confirm(`Re-submit this package to Amazon?${label ? '\n\n' + label : ''}`)) return;
+    errorBulkBusy = true;
+    syncErrorSelectionControls();
+    const status = $('#errorsBulkStatus');
+    if (status) status.textContent = 'Retrying…';
+    try {
+      const out = await apiPost(`/admin/errors/${encodeURIComponent(uuid)}/retry`);
+      errorBulkMessage = `Retry → ${out.status}${out.errorMessage ? ': ' + out.errorMessage : ''}`;
+      await loadErrors();
+    } catch (err) {
+      errorBulkMessage = 'Retry failed: ' + err.message;
+      if (status) status.textContent = errorBulkMessage;
+    } finally {
+      errorBulkBusy = false;
+      syncErrorSelectionControls();
+    }
+  }
+
+  async function retrySelectedErrors() {
+    if (errorBulkBusy) return;
+    const uuids = [...selectedErrorUuids].filter((u) => {
+      const rec = errorsByUuid.get(u);
+      return rec && (rec.status === 'FAILED' || rec.status === 'BLOCKED');
+    });
+    if (!uuids.length) return;
+    if (!confirm(`Re-submit ${uuids.length} package${uuids.length === 1 ? '' : 's'} to Amazon with the same payload?`)) return;
+    errorBulkBusy = true;
+    syncErrorSelectionControls();
+    const status = $('#errorsBulkStatus');
+    if (status) status.textContent = `Retrying ${uuids.length}…`;
+    try {
+      const out = await apiPost('/admin/errors/retry-batch', { uuids });
+      errorBulkMessage = `Retried ${out.retried}, skipped ${out.skipped}${out.failed ? `, ${out.failed} failed` : ''}${out.missing ? `, ${out.missing} missing` : ''}.`;
+      await loadErrors();
+    } catch (err) {
+      errorBulkMessage = 'Bulk retry failed: ' + err.message;
+      if (status) status.textContent = errorBulkMessage;
+    } finally {
+      errorBulkBusy = false;
+      syncErrorSelectionControls();
+    }
+  }
+
+  // Run the AI review on the active (un-archived) errors in the selection.
+  async function reviewSelectedErrors() {
+    if (errorBulkBusy) return;
+    const uuids = [...selectedErrorUuids].filter((u) => {
+      const rec = errorsByUuid.get(u);
+      return rec && !rec.archived;
+    });
+    if (!uuids.length) return;
+    if (!confirm(`Run the AI review on ${uuids.length} selected error${uuids.length === 1 ? '' : 's'}? This calls the model once per submission.`)) return;
+    errorBulkBusy = true;
+    syncErrorSelectionControls();
+    const status = $('#errorsBulkStatus');
+    if (status) status.textContent = 'Reviewing…';
+    try {
+      const out = await apiPost('/admin/errors/review-batch', { uuids });
+      errorBulkMessage = `Reviewed ${out.reviewed}, skipped ${out.skipped}, failed ${out.failed} of ${out.totalFailed}.`;
+      await loadErrors();
+      if (status) status.textContent = errorBulkMessage;
+    } catch (err) {
+      if (err.message === '401') return;
+      errorBulkMessage = 'Batch review failed: ' + err.message;
+      if (status) status.textContent = errorBulkMessage;
+    } finally {
+      errorBulkBusy = false;
+      syncErrorSelectionControls();
+    }
+  }
+
   if (aiApplyBtn) aiApplyBtn.addEventListener('click', applyAiFix);
   if (aiRejectBtn) aiRejectBtn.addEventListener('click', rejectAiFix);
   if (aiRerunBtn) aiRerunBtn.addEventListener('click', () => { if (aiModalUuid) runReview(aiModalUuid, true, true); });
@@ -1676,8 +2838,74 @@
 
   const reviewAllBtn = $('#reviewAllErrors');
   if (reviewAllBtn) reviewAllBtn.addEventListener('click', reviewAllErrors);
+  const archiveSelectedBtn = $('#archiveSelectedErrors');
+  if (archiveSelectedBtn) archiveSelectedBtn.addEventListener('click', () => bulkArchiveErrors(true));
+  const unarchiveSelectedBtn = $('#unarchiveSelectedErrors');
+  if (unarchiveSelectedBtn) unarchiveSelectedBtn.addEventListener('click', () => bulkArchiveErrors(false));
+  const reviewSelectedBtn = $('#reviewSelectedErrors');
+  if (reviewSelectedBtn) reviewSelectedBtn.addEventListener('click', reviewSelectedErrors);
+  const retrySelectedBtn = $('#retrySelectedErrors');
+  if (retrySelectedBtn) retrySelectedBtn.addEventListener('click', retrySelectedErrors);
+  const errorsFiltersClear = $('#errorsColumnFiltersClear');
+  if (errorsFiltersClear) errorsFiltersClear.addEventListener('click', clearAllErrorColumnFilters);
+
+  document.querySelectorAll('#errorsSubtabs .view-subtab').forEach((btn) => {
+    btn.addEventListener('click', () => setErrorsView(btn.dataset.errorsView));
+  });
+
+  loadErrorPageSize();
+  const errorsPageSizeSel = $('#errorsPageSize');
+  if (errorsPageSizeSel) {
+    errorsPageSizeSel.value = String(errorPageState.pageSize);
+    errorsPageSizeSel.addEventListener('change', () => {
+      const size = Number(errorsPageSizeSel.value);
+      if (!ERROR_PAGE_SIZES.includes(size)) return;
+      errorPageState.pageSize = size;
+      errorPageState.page = 1;
+      saveErrorPageSize();
+      renderErrorsTable();
+    });
+  }
+  const errorsPageFirst = $('#errorsPageFirst');
+  if (errorsPageFirst) errorsPageFirst.addEventListener('click', () => goToErrorsPage(1));
+  const errorsPagePrev = $('#errorsPagePrev');
+  if (errorsPagePrev) errorsPagePrev.addEventListener('click', () => goToErrorsPage(errorPageState.page - 1));
+  const errorsPageNext = $('#errorsPageNext');
+  if (errorsPageNext) errorsPageNext.addEventListener('click', () => goToErrorsPage(errorPageState.page + 1));
+  const errorsPageLast = $('#errorsPageLast');
+  if (errorsPageLast) errorsPageLast.addEventListener('click', () => goToErrorsPage(Number.MAX_SAFE_INTEGER));
+
+  $('#errorsTable').addEventListener('change', (e) => {
+    const selectAll = e.target.closest('#selectAllErrors');
+    if (selectAll) {
+      errorBulkMessage = '';
+      document.querySelectorAll('#errorsTable tbody input.error-select').forEach((cb) => {
+        cb.checked = selectAll.checked;
+        if (cb.checked) selectedErrorUuids.add(cb.dataset.uuid);
+        else selectedErrorUuids.delete(cb.dataset.uuid);
+      });
+      syncErrorSelectionControls();
+      return;
+    }
+    const cb = e.target.closest('input.error-select');
+    if (!cb) return;
+    errorBulkMessage = '';
+    if (cb.checked) selectedErrorUuids.add(cb.dataset.uuid);
+    else selectedErrorUuids.delete(cb.dataset.uuid);
+    syncErrorSelectionControls();
+  });
 
   $('#errorsTable').addEventListener('click', (e) => {
+    const retryBtn = e.target.closest('button.error-retry-btn');
+    if (retryBtn) {
+      retryOneError(retryBtn.dataset.uuid);
+      return;
+    }
+    const archiveBtn = e.target.closest('button.ai-archive-btn');
+    if (archiveBtn) {
+      toggleArchiveError(archiveBtn.dataset.uuid, archiveBtn.dataset.archived !== '1');
+      return;
+    }
     const btn = e.target.closest('button.ai-review-btn');
     if (!btn) return;
     openAiModal(btn.dataset.uuid);
@@ -1708,21 +2936,23 @@
   }));
   document.querySelectorAll('.refresh').forEach((b) => b.addEventListener('click', () => loaders[b.dataset.refresh]()));
 
-  $('#jobsTable tbody').addEventListener('change', (e) => {
+  $('#jobsTable').addEventListener('change', (e) => {
+    const selectAllRows = e.target.closest('#selectAllJobsRows');
+    if (selectAllRows) {
+      jobBulkMessage = '';
+      document.querySelectorAll('#jobsTable tbody input.job-select:not(:disabled)').forEach((cb) => {
+        cb.checked = selectAllRows.checked;
+        if (cb.checked) selectedJobIds.add(cb.dataset.jobId);
+        else selectedJobIds.delete(cb.dataset.jobId);
+      });
+      syncJobSelectionControls();
+      return;
+    }
     const cb = e.target.closest('input.job-select');
     if (!cb) return;
     jobBulkMessage = '';
     if (cb.checked) selectedJobIds.add(cb.dataset.jobId);
     else selectedJobIds.delete(cb.dataset.jobId);
-    syncJobSelectionControls();
-  });
-  $('#selectAllJobs').addEventListener('change', (e) => {
-    jobBulkMessage = '';
-    document.querySelectorAll('#jobsTable tbody input.job-select:not(:disabled)').forEach((cb) => {
-      cb.checked = e.target.checked;
-      if (cb.checked) selectedJobIds.add(cb.dataset.jobId);
-      else selectedJobIds.delete(cb.dataset.jobId);
-    });
     syncJobSelectionControls();
   });
   $('#approveSelectedJobs').addEventListener('click', approveSelectedJobs);
@@ -1769,6 +2999,20 @@
   if (logoutBtn) logoutBtn.addEventListener('click', logout);
 
   $('#auditSubmission').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadAudit(); });
+
+  const jobsSearch = $('#jobsSearch');
+  if (jobsSearch) {
+    jobsSearch.addEventListener('input', () => {
+      clearTimeout(jobsSearchTimer);
+      jobsSearchTimer = setTimeout(loadJobs, 300);
+    });
+    jobsSearch.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        clearTimeout(jobsSearchTimer);
+        loadJobs();
+      }
+    });
+  }
 
   $('#queueTable').addEventListener('change', (e) => {
     const selectAllRows = e.target.closest('#selectAllQueueRows');
@@ -1859,6 +3103,9 @@
   api('/admin/me').then((r) => showSession(r.user)).catch(() => {});
 
   loadQueueColState();
+  loadJobsColState();
+  loadErrorsView();
+  loadErrorColState();
   refreshActive();
   setInterval(loadMetrics, 15000);
   setInterval(loadStatus, 30000);

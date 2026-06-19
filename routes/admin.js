@@ -29,6 +29,7 @@ const aiResolutions = require('../src/aiResolutions');
 const packageValidator = require('../src/packageValidator');
 const { buildRequestBody } = require('../src/packageRequestBody');
 const forwarder = require('../src/forwarder');
+const errorRetry = require('../src/errorRetry');
 const { resolveByCode } = require('../config/marketplaces');
 
 const router = express.Router();
@@ -364,13 +365,65 @@ router.post('/admin/group/changes', adminAuth, express.json(), async (req, res, 
   } catch (err) { next(err); }
 });
 
-router.get('/admin/jobs', adminAuth, (req, res) => {
-  res.json({ jobs: jobs.list({ limit: req.query.limit || 100 }).map((j) => ({
-    jobId: j.job_uuid, kind: j.kind, caller: j.caller, asin: j.asin, marketplaceCode: j.marketplace_code,
+function mapJobToApiRow(j) {
+  return {
+    jobId: j.job_uuid, kind: j.kind, caller: j.caller, asin: j.asin, itemNumber: j.item_number,
+    marketplaceCode: j.marketplace_code, productType: j.product_type, requestedBy: j.requested_by,
     status: j.status, okCount: j.ok_count, failedCount: j.failed_count, targetCount: j.target_count,
     pendingApprovalCount: submissions.listForJob(j.job_uuid).filter((s) => s.status === 'PENDING_APPROVAL').length,
+    fieldNames: Array.isArray(j.field_names) ? j.field_names : null,
     label: j.label, createdAt: j.created_at, completedAt: j.completed_at
-  })) });
+  };
+}
+
+const JOB_EXPORT_COLS = [
+  'jobId', 'createdAt', 'completedAt', 'kind', 'caller', 'asin', 'itemNumber',
+  'marketplaceCode', 'productType', 'label', 'fieldNames', 'okCount', 'failedCount',
+  'targetCount', 'pendingApprovalCount', 'status', 'requestedBy'
+];
+
+function csvEsc(v) {
+  const s = v == null ? '' : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function jobToCsvRow(row) {
+  return JOB_EXPORT_COLS.map((c) => {
+    if (c === 'fieldNames') {
+      const names = Array.isArray(row.fieldNames) ? row.fieldNames.filter(Boolean) : [];
+      return csvEsc(names.join('; '));
+    }
+    return csvEsc(row[c]);
+  }).join(',');
+}
+
+router.get('/admin/jobs', adminAuth, (req, res) => {
+  const search = req.query.search != null ? String(req.query.search).trim() : '';
+  const beforeId = req.query.beforeId != null && req.query.beforeId !== '' ? Number(req.query.beforeId) : null;
+  const listOpts = {
+    limit: req.query.limit || 100,
+    search: search || null,
+    beforeId
+  };
+  const raw = jobs.list(listOpts);
+  const rows = raw.map(mapJobToApiRow);
+  const nextBeforeId = raw.length ? raw[raw.length - 1].id : null;
+  const countOpts = search ? { search } : {};
+  res.json({ jobs: rows, total: jobs.count(countOpts), nextBeforeId });
+});
+
+// CSV export of all jobs (optionally filtered by search). The console passes
+// the operator JWT via ?token= since <a> downloads can't set Authorization.
+router.get('/admin/jobs/export', adminAuth, (req, res) => {
+  const search = req.query.search != null ? String(req.query.search).trim() : '';
+  const raw = jobs.listAll({ search: search || null });
+  const rows = raw.map(mapJobToApiRow);
+  const lines = [JOB_EXPORT_COLS.join(',')];
+  for (const row of rows) lines.push(jobToCsvRow(row));
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="amazon-push-jobs-${stamp}.csv"`);
+  res.send(lines.join('\n'));
 });
 
 // Every submission carrying an Amazon error/diagnostic, distilled for the
@@ -415,6 +468,7 @@ function sendResolutionResult(res, result) {
   if (!result) return res.status(500).json({ error: 'resolver_error' });
   if (result.reason === 'resolver_disabled') return res.status(503).json({ error: 'resolver_disabled', message: 'OPENAI_API_KEY is not configured (AI resolver is off).' });
   if (result.reason === 'submission_not_found') return res.status(404).json({ error: 'submission_not_found' });
+  if (result.reason === 'archived') return res.status(409).json({ error: 'archived', message: 'This error is archived; un-archive it to assess an AI fix.' });
   if (result.reason === 'llm_failed') return res.status(502).json({ error: 'llm_failed', message: result.error || 'model call failed', resolution: result.resolution || null });
   return res.json({ ok: true, cached: !!result.cached, resolution: result.resolution });
 }
@@ -445,10 +499,22 @@ router.get('/admin/errors/:uuid/review', adminAuth, (req, res) => {
 router.post('/admin/errors/review-batch', adminAuth, express.json(), async (req, res, next) => {
   try {
     if (!aiResolver.isEnabled()) return res.status(503).json({ error: 'resolver_disabled', message: 'OPENAI_API_KEY is not configured (AI resolver is off).' });
-    const cap = Math.max(1, Math.min(50, Number(req.body && req.body.limit) || 25));
     const force = !!(req.body && req.body.force);
     const actor = operatorName(req);
-    const failed = submissions.listErrors({ limit: 1000 }).filter((r) => r.status === 'FAILED');
+    // An explicit `uuids` set restricts the batch to just the selected errors
+    // (the console's "Review selected"); otherwise we review every un-resolved
+    // failed submission ("Review all"). Archived errors are always excluded so
+    // no AI fix is assessed for them.
+    const requested = Array.isArray(req.body && req.body.uuids) ? req.body.uuids.filter(Boolean) : [];
+    const hasSelection = requested.length > 0;
+    const cap = hasSelection
+      ? Math.max(1, Math.min(100, requested.length))
+      : Math.max(1, Math.min(50, Number(req.body && req.body.limit) || 25));
+    let failed = submissions.listErrors({ limit: 1000 }).filter((r) => r.status === 'FAILED' && !r.archived_at);
+    if (hasSelection) {
+      const want = new Set(requested);
+      failed = failed.filter((r) => want.has(r.submission_uuid));
+    }
     let reviewed = 0; let skipped = 0; let failedCount = 0;
     for (const row of failed) {
       if (reviewed >= cap) break;
@@ -467,6 +533,58 @@ router.post('/admin/errors/review-batch', adminAuth, express.json(), async (req,
   } catch (err) { next(err); }
 });
 
+// Re-submit one failed submission with its original stored package (operator
+// retry after fixing upstream data). Gated by the master kill switch.
+router.post('/admin/errors/:uuid/retry', adminAuth, writeGate, express.json(), async (req, res, next) => {
+  try {
+    const actor = operatorName(req);
+    const result = await errorRetry.retrySubmission(req.params.uuid, { actor });
+    if (result.reason === 'submission_not_found') return res.status(404).json({ error: 'submission_not_found' });
+    if (result.reason === 'not_retryable') {
+      return res.status(409).json({ error: 'not_retryable', message: `Submission status ${result.status} cannot be retried.` });
+    }
+    res.status(202).json({
+      ok: true,
+      submissionId: result.submissionUuid,
+      status: result.status,
+      issues: result.issues,
+      errorMessage: result.errorMessage
+    });
+  } catch (err) { next(err); }
+});
+
+// Bulk retry: re-forward each selected failed submission sequentially.
+router.post('/admin/errors/retry-batch', adminAuth, writeGate, express.json(), async (req, res, next) => {
+  try {
+    const uuids = Array.isArray(req.body && req.body.uuids) ? req.body.uuids.filter(Boolean).slice(0, 1000) : [];
+    if (!uuids.length) return res.status(400).json({ error: 'no_submissions' });
+    const actor = operatorName(req);
+    const seen = new Set();
+    let retried = 0; let skipped = 0; let failed = 0; let missing = 0;
+    const results = [];
+    for (const uuid of uuids) {
+      if (seen.has(uuid)) continue;
+      seen.add(uuid);
+      const submission = submissions.getByUuid(uuid);
+      if (!submission) { missing++; continue; }
+      if (!errorRetry.isRetryable(submission)) { skipped++; continue; }
+      const result = await errorRetry.retrySubmission(uuid, { actor });
+      if (!result.ok) { skipped++; continue; }
+      retried++;
+      results.push({
+        submissionUuid: uuid,
+        status: result.status,
+        errorMessage: result.errorMessage || null
+      });
+      if (result.status === 'FAILED' || result.status === 'BLOCKED') failed++;
+    }
+    if (retried) {
+      audit.record({ event: 'error_retry_batch', actor, details: { via: 'console', retried, skipped, failed, missing } });
+    }
+    res.json({ ok: true, retried, skipped, failed, missing, results });
+  } catch (err) { next(err); }
+});
+
 // Reject a proposal: discard it, never sent to Amazon.
 router.post('/admin/errors/:uuid/reject', adminAuth, express.json(), (req, res) => {
   const existing = aiResolutions.getBySubmission(req.params.uuid);
@@ -475,6 +593,44 @@ router.post('/admin/errors/:uuid/reject', adminAuth, express.json(), (req, res) 
   const updated = aiResolutions.setStatus(req.params.uuid, { status: 'REJECTED', reviewedBy: actor });
   audit.record({ event: 'ai_fix_rejected', submissionUuid: req.params.uuid, actor, details: { via: 'console' } });
   res.json({ ok: true, resolution: aiResolutions.toRecord(updated) });
+});
+
+// Archive an error so the AI resolver skips it (no single or batch fix is
+// assessed). The submission stays visible in the Errors tab marked archived.
+// Pass { archived: false } to un-archive.
+router.post('/admin/errors/:uuid/archive', adminAuth, express.json(), (req, res) => {
+  const submission = submissions.getByUuid(req.params.uuid);
+  if (!submission) return res.status(404).json({ error: 'submission_not_found' });
+  const archived = !(req.body && req.body.archived === false);
+  const actor = operatorName(req);
+  const updated = submissions.setArchived(req.params.uuid, { archived, actor });
+  audit.record({ event: archived ? 'error_archived' : 'error_unarchived', submissionUuid: req.params.uuid, actor, details: { via: 'console' } });
+  res.json({ ok: true, archived: !!updated.archived_at, archivedBy: updated.archived_by || null, archivedAt: updated.archived_at || null });
+});
+
+// Bulk archive / un-archive a posted set of error submissions in one click.
+// Pass { archived: false } to un-archive. Archived errors are skipped by the AI
+// resolver (no single or batch fix is assessed). Missing UUIDs are reported but
+// don't fail the batch.
+router.post('/admin/errors/archive-batch', adminAuth, express.json(), (req, res) => {
+  const uuids = Array.isArray(req.body && req.body.uuids) ? req.body.uuids.filter(Boolean).slice(0, 1000) : [];
+  if (!uuids.length) return res.status(400).json({ error: 'no_submissions' });
+  const archived = !(req.body && req.body.archived === false);
+  const actor = operatorName(req);
+  const done = [];
+  const seen = new Set();
+  let missing = 0;
+  for (const uuid of uuids) {
+    if (seen.has(uuid)) continue;
+    seen.add(uuid);
+    if (!submissions.getByUuid(uuid)) { missing++; continue; }
+    submissions.setArchived(uuid, { archived, actor });
+    done.push(uuid);
+  }
+  if (done.length) {
+    audit.record({ event: archived ? 'error_archived_batch' : 'error_unarchived_batch', actor, details: { via: 'console', count: done.length, submissionUuids: done } });
+  }
+  res.json({ ok: true, archived, changed: done.length, missing });
 });
 
 // Operator approval: take the (optionally edited) proposed package, re-validate

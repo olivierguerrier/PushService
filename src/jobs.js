@@ -75,8 +75,10 @@ function getByUuid(jobUuid) {
   return hydrate(getDb().prepare('SELECT * FROM push_jobs WHERE job_uuid = ?').get(jobUuid));
 }
 
-function list({ status = null, kind = null, asin = null, marketplaceCode = null, sinceIso = null, limit = 100 } = {}) {
-  const db = getDb();
+function buildWhere({
+  status = null, kind = null, asin = null, marketplaceCode = null, sinceIso = null,
+  search = null, beforeId = null
+} = {}) {
   const conds = [];
   const params = [];
   if (status) { conds.push('status = ?'); params.push(status); }
@@ -84,9 +86,62 @@ function list({ status = null, kind = null, asin = null, marketplaceCode = null,
   if (asin) { conds.push('asin = ?'); params.push(String(asin).toUpperCase()); }
   if (marketplaceCode) { conds.push('marketplace_code = ?'); params.push(String(marketplaceCode).toUpperCase()); }
   if (sinceIso) { conds.push('created_at >= ?'); params.push(sinceIso); }
+  const q = search != null ? String(search).trim() : '';
+  if (q) {
+    const term = `%${q.toLowerCase()}%`;
+    conds.push(`(
+      LOWER(job_uuid) LIKE ? OR
+      LOWER(COALESCE(asin, '')) LIKE ? OR
+      LOWER(COALESCE(caller, '')) LIKE ? OR
+      LOWER(COALESCE(kind, '')) LIKE ? OR
+      LOWER(COALESCE(label, '')) LIKE ? OR
+      LOWER(COALESCE(item_number, '')) LIKE ? OR
+      LOWER(COALESCE(marketplace_code, '')) LIKE ? OR
+      LOWER(COALESCE(product_type, '')) LIKE ? OR
+      LOWER(COALESCE(status, '')) LIKE ? OR
+      LOWER(COALESCE(requested_by, '')) LIKE ? OR
+      LOWER(COALESCE(field_names_json, '')) LIKE ?
+    )`);
+    for (let i = 0; i < 11; i++) params.push(term);
+  }
+  if (beforeId != null && Number.isFinite(Number(beforeId))) {
+    conds.push('id < ?');
+    params.push(Number(beforeId));
+  }
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  return { where, params };
+}
+
+function list({
+  status = null, kind = null, asin = null, marketplaceCode = null, sinceIso = null,
+  search = null, beforeId = null, limit = 100
+} = {}) {
+  const db = getDb();
+  const { where, params } = buildWhere({ status, kind, asin, marketplaceCode, sinceIso, search, beforeId });
   const cap = Math.max(1, Math.min(500, Number(limit) || 100));
   return db.prepare(`SELECT * FROM push_jobs ${where} ORDER BY created_at DESC, id DESC LIMIT ${cap}`).all(...params).map(hydrate);
+}
+
+function count(opts = {}) {
+  const { where, params } = buildWhere(opts);
+  return getDb().prepare(`SELECT COUNT(*) AS n FROM push_jobs ${where}`).get(...params).n;
+}
+
+// Walk the full job history in keyset batches (newest first). Used by CSV export
+// and any caller that needs every row matching the filter, not just one page.
+function listAll({ search = null, maxRows = 100000 } = {}) {
+  const cap = Math.max(1, Number(maxRows) || 100000);
+  const batchSize = 500;
+  const all = [];
+  let beforeId = null;
+  while (all.length < cap) {
+    const batch = list({ search, beforeId, limit: batchSize });
+    if (!batch.length) break;
+    all.push(...batch);
+    beforeId = batch[batch.length - 1].id;
+    if (batch.length < batchSize) break;
+  }
+  return all.slice(0, cap);
 }
 
 // Close only legacy jobs whose fan-out was interrupted before every target
@@ -153,4 +208,4 @@ function recoverStuckJobs({ staleAfterMinutes = 15 } = {}) {
   return summary;
 }
 
-module.exports = { create, update, getByUuid, list, recoverStuckJobs };
+module.exports = { create, update, getByUuid, list, listAll, count, recoverStuckJobs };

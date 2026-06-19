@@ -206,7 +206,12 @@ function migrateColumns(db) {
       // poller increments this when getFeed throws and abandons the submission
       // as FAILED once it crosses POLLER_MAX_FEED_ERRORS, so an unpollable feed
       // can't loop forever. Reset to 0 on any successful status read.
-      { name: 'poll_error_count', ddl: 'poll_error_count INTEGER NOT NULL DEFAULT 0' }
+      { name: 'poll_error_count', ddl: 'poll_error_count INTEGER NOT NULL DEFAULT 0' },
+      // Operator-archived error: when set, the submission is excluded from AI
+      // error resolution (no single or batch AI review is assessed for it). The
+      // row still appears in the Errors tab marked as archived. NULL = active.
+      { name: 'archived_at', ddl: 'archived_at TEXT' },
+      { name: 'archived_by', ddl: 'archived_by TEXT' }
     ]
   };
   for (const [table, cols] of Object.entries(ADDITIONS)) {

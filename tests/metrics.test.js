@@ -89,3 +89,41 @@ test('dashboard metrics reflect 24h jobs including finished work', () => {
   assert.equal(m2.jobs24h.total, 2);
   assert.equal(m2.progress24h.total, 4);
 });
+
+test('throughput uses elapsed time since job start when under rolling window', () => {
+  const jobUuid = 'job-metrics-dynamic-speed';
+  const startedAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  jobs.create({
+    jobUuid,
+    kind: 'patchItem',
+    targetCount: 21,
+    asin: 'B000SPEED01'
+  });
+  jobs.update(jobUuid, {
+    status: 'running',
+    started_at: startedAt,
+    ok_count: 21,
+    failed_count: 0
+  });
+
+  const db = getDb();
+  for (let i = 0; i < 21; i += 1) {
+    submissions.insert({
+      submissionUuid: `sub-metrics-speed-${i}`,
+      jobUuid,
+      caller: 'test',
+      scope: 'listing',
+      operation: 'patch',
+      status: 'APPLIED',
+      requestBody: {}
+    });
+    db.prepare(`UPDATE push_submissions SET updated_at = datetime('now', '-1 minutes') WHERE submission_uuid = ?`)
+      .run(`sub-metrics-speed-${i}`);
+  }
+
+  const m = metrics.getDashboard();
+  assert.equal(m.throughput.sinceStart, true);
+  assert.ok(m.throughput.settled >= 21, `expected >=21 settled, got ${m.throughput.settled}`);
+  assert.ok(m.throughput.windowMinutes < metrics.THROUGHPUT_WINDOW_MIN);
+  assert.ok(m.throughput.perMinute > 7, `expected >7/min, got ${m.throughput.perMinute}`);
+});

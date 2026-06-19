@@ -32,23 +32,32 @@ function record({ event, submissionUuid = null, jobUuid = null, actor = null, de
   let prev = '';
   try {
     const db = getDb();
-    prev = lastHash(db);
     const body = { event_uuid: eventUuid, submission_uuid: submissionUuid, job_uuid: jobUuid, event, actor, details: safeDetails, at };
-    hash = crypto.createHash('sha256').update(prev + canonical(body)).digest('hex');
-    db.prepare(`
-      INSERT INTO audit_events (event_uuid, submission_uuid, job_uuid, event, actor, details_json, prev_hash, hash, at)
-      VALUES (@event_uuid, @submission_uuid, @job_uuid, @event, @actor, @details_json, @prev_hash, @hash, @at)
-    `).run({
-      event_uuid: eventUuid,
-      submission_uuid: submissionUuid,
-      job_uuid: jobUuid,
-      event,
-      actor,
-      details_json: safeDetails == null ? null : JSON.stringify(safeDetails),
-      prev_hash: prev,
-      hash,
-      at
+    // Reading the chain head and inserting the new row must be atomic with
+    // respect to every other writer — including a *separate process* (WAL
+    // allows concurrent connections, e.g. an instance booting while the
+    // outgoing one is still forwarding). A BEGIN IMMEDIATE transaction takes
+    // the write lock before reading lastHash, so two writers can't both branch
+    // off the same prev_hash and fork the chain.
+    const append = db.transaction(() => {
+      prev = lastHash(db);
+      hash = crypto.createHash('sha256').update(prev + canonical(body)).digest('hex');
+      db.prepare(`
+        INSERT INTO audit_events (event_uuid, submission_uuid, job_uuid, event, actor, details_json, prev_hash, hash, at)
+        VALUES (@event_uuid, @submission_uuid, @job_uuid, @event, @actor, @details_json, @prev_hash, @hash, @at)
+      `).run({
+        event_uuid: eventUuid,
+        submission_uuid: submissionUuid,
+        job_uuid: jobUuid,
+        event,
+        actor,
+        details_json: safeDetails == null ? null : JSON.stringify(safeDetails),
+        prev_hash: prev,
+        hash,
+        at
+      });
     });
+    append.immediate();
   } catch (err) {
     console.warn(`[audit] DB record failed for '${event}': ${err.message}`);
   }

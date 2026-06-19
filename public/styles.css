@@ -1023,6 +1023,34 @@ body.grid-col-resizing * {
 .ai-cell { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
 .ai-cell .badge { font-size: 10px; }
 .ai-review-btn { border: 1px solid var(--border-color, rgba(0,0,0,0.12)); }
+.ai-archive-btn { border: 1px solid var(--border-color, rgba(0,0,0,0.12)); }
+tr.row-archived { opacity: 0.55; }
+
+.view-subtabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 12px;
+  padding: 0 2px;
+  border-bottom: 1px solid var(--border-color);
+}
+.view-subtab {
+  position: relative;
+  margin: 0 0 -1px;
+  padding: 8px 14px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-family);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+}
+.view-subtab:hover { color: var(--text-primary); }
+.view-subtab.active {
+  color: var(--color-primary);
+  border-bottom-color: var(--color-primary);
+}
 
 .ai-modal-overlay {
   position: fixed;
@@ -1207,6 +1235,32 @@ tr.group-row.expanded > td { box-shadow: inset 0 -1px 0 var(--color-primary); }
 .group-vendors { font-weight: var(--font-weight-semibold); color: var(--text-secondary); }
 .group-status > .badge { margin-right: 4px; }
 .group-status > .badge + .badge { margin-top: 2px; }
+
+.field-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  max-width: 100%;
+}
+.field-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: var(--font-weight-medium);
+  line-height: 1.3;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--soft-blue);
+  color: var(--color-primary);
+  white-space: nowrap;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.field-tag-more {
+  background: rgba(45, 108, 223, 0.12);
+  color: var(--text-muted);
+}
 
 /* Before / posted / after table inside an expanded group */
 .bpa-table {
