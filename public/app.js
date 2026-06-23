@@ -57,6 +57,29 @@
     if (_bannerEl) _bannerEl.style.display = 'none';
   }
 
+  const API_TIMEOUT_MS = 20000;
+  const API_BULK_TIMEOUT_MS = 90000;
+  async function fetchWithTimeout(url, opts, timeoutMs = API_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...opts, signal: controller.signal });
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        const e = new Error('timeout');
+        e.code = 'timeout';
+        throw e;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function isTransientFailure(err) {
+    return err && (err.message === '503' || err.message === 'timeout' || err.code === 'timeout');
+  }
+
   // Decode the server's error code from a non-OK response without throwing.
   async function errorCode(res) {
     try { const j = await res.json(); return j.error || j.status || String(res.status); }
@@ -69,11 +92,15 @@
     return code === 'auth_lookup_failed' || code === 'auth_unavailable';
   }
 
-  async function api(path) {
+  async function api(path, { timeoutMs } = {}) {
     let res;
     try {
-      res = await fetch(path, { headers: headers(), credentials: 'same-origin' });
-    } catch (_) {
+      res = await fetchWithTimeout(path, { headers: headers(), credentials: 'same-origin' }, timeoutMs);
+    } catch (err) {
+      if (err && err.message === 'timeout') {
+        connectionBanner(`${path} timed out — retrying…`);
+        throw new Error('timeout');
+      }
       connectionBanner('Network error — reconnecting…');
       throw new Error('503');
     }
@@ -86,7 +113,7 @@
     }
     throw new Error(friendly(code));
   }
-  async function apiPost(path, body) {
+  async function apiPost(path, body, { timeoutMs } = {}) {
     const opts = { method: 'POST', headers: headers(), credentials: 'same-origin' };
     if (body !== undefined) {
       opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers);
@@ -94,8 +121,12 @@
     }
     let res;
     try {
-      res = await fetch(path, opts);
-    } catch (_) {
+      res = await fetchWithTimeout(path, opts, timeoutMs);
+    } catch (err) {
+      if (err && err.message === 'timeout') {
+        connectionBanner(`${path} timed out — retrying…`);
+        throw new Error('timeout');
+      }
       connectionBanner('Network error — reconnecting…');
       throw new Error('503');
     }
@@ -128,9 +159,48 @@
     return m ? `~${h} h ${m} min` : `~${h} h`;
   }
 
+  let lastMetricsHtml = null;
+  let lastStatusHtml = null;
+
+  function renderStatusGrid(s) {
+    $('#versionTag').textContent = 'v' + s.version;
+    const dot = $('#writeDot');
+    dot.className = 'dot ' + (s.writesEnabled ? 'on' : 'off');
+    const chain = s.auditChain || {};
+    const credsOk = s.spApi.clientIdConfigured && s.spApi.refreshTokenConfigured;
+    const listingOk = !!(s.listingApp && s.listingApp.ok);
+    const chainText = chain.pending
+      ? 'checking'
+      : chain.ok ? `intact (${chain.checked})` : `BROKEN @${chain.brokenAtId || '?'}`;
+    const cells = [
+      ['Writes', s.writesEnabled ? 'ENABLED' : 'disabled', s.writesEnabled ? 'pos' : 'warn'],
+      ['SP-API creds', credsOk ? 'configured' : 'missing', credsOk ? 'pos' : 'neg'],
+      ['ListingApp', listingOk ? 'reachable' : (s.listingApp && s.listingApp.reason === 'checking' ? 'checking' : 'unreachable'), listingOk ? 'pos' : 'warn'],
+      ['Content source', s.contentSource ? s.contentSource.mode : '—', ''],
+      ['Callers', s.callersConfigured, ''],
+      ['Approvers', s.approversConfigured, ''],
+      ['Audit chain', chainText, chain.pending ? 'warn' : chain.ok ? 'pos' : 'neg']
+    ];
+    return cells.map(([k, v, tone]) =>
+      `<div class="kpi${tone ? ' kpi-' + tone : ''}"><div class="kpi-label">${esc(k)}</div><div class="kpi-value">${esc(v)}</div></div>`
+    ).join('');
+  }
+
   async function loadMetrics() {
     try {
       const m = await api('/admin/metrics');
+      if (m.refreshing && !m.stale && !lastMetricsHtml) {
+        const el = $('#metricsGrid');
+        if (el) el.textContent = 'Calculating dashboard…';
+        const bar = $('#metricsProgress');
+        if (bar) {
+          bar.classList.add('hidden');
+          bar.setAttribute('aria-hidden', 'true');
+        }
+        setTimeout(loadMetrics, 2000);
+        return;
+      }
+      if (m.refreshing) setTimeout(loadMetrics, 2000);
       const w = m.windowHours || 24;
       const j24 = m.jobs24h || {};
       const jobsInProgress = (j24.running || 0) + (j24.pending || 0);
@@ -164,6 +234,7 @@
         (detail ? `<div class="kpi-detail">${esc(detail)}</div>` : '') +
         `</div>`
       ).join('');
+      lastMetricsHtml = $('#metricsGrid').innerHTML;
 
       const prog = m.progress24h || m.progress || {};
       const showBar = (prog.total || 0) > 0;
@@ -193,40 +264,39 @@
     } catch (e) {
       if (e.message === '401') return;
       const el = $('#metricsGrid');
-      if (el) el.textContent = 'Error: ' + e.message;
+      if (!el) return;
+      if (isTransientFailure(e) && lastMetricsHtml) {
+        el.innerHTML = lastMetricsHtml;
+        return;
+      }
+      el.textContent = e.message === 'timeout' ? 'Request timed out — retrying…'
+        : isTransientFailure(e) ? 'Reconnecting…' : 'Error: ' + e.message;
     }
   }
 
   async function loadStatus() {
     try {
       const s = await api('/admin/status');
-      $('#versionTag').textContent = 'v' + s.version;
-      const dot = $('#writeDot');
-      dot.className = 'dot ' + (s.writesEnabled ? 'on' : 'off');
-      const chain = s.auditChain || {};
-      const credsOk = s.spApi.clientIdConfigured && s.spApi.refreshTokenConfigured;
-      const listingOk = !!(s.listingApp && s.listingApp.ok);
-      const cells = [
-        ['Writes', s.writesEnabled ? 'ENABLED' : 'disabled', s.writesEnabled ? 'pos' : 'warn'],
-        ['SP-API creds', credsOk ? 'configured' : 'missing', credsOk ? 'pos' : 'neg'],
-        ['ListingApp', listingOk ? 'reachable' : 'unreachable', listingOk ? 'pos' : 'neg'],
-        ['Content source', s.contentSource ? s.contentSource.mode : '—', ''],
-        ['Callers', s.callersConfigured, ''],
-        ['Approvers', s.approversConfigured, ''],
-        ['Audit chain', chain.ok ? `intact (${chain.checked})` : `BROKEN @${chain.brokenAtId}`, chain.ok ? 'pos' : 'neg']
-      ];
-      $('#statusGrid').innerHTML = cells.map(([k, v, tone]) =>
-        `<div class="kpi${tone ? ' kpi-' + tone : ''}"><div class="kpi-label">${esc(k)}</div><div class="kpi-value">${esc(v)}</div></div>`
-      ).join('');
+      const html = renderStatusGrid(s);
+      $('#statusGrid').innerHTML = html;
+      lastStatusHtml = html;
     } catch (e) {
-      if (e.message === '401') return; // redirect already in flight
-      $('#statusGrid').textContent = 'Error: ' + e.message;
+      if (e.message === '401') return;
+      const el = $('#statusGrid');
+      if (!el) return;
+      if (isTransientFailure(e) && lastStatusHtml) {
+        el.innerHTML = lastStatusHtml;
+        return;
+      }
+      el.textContent = e.message === 'timeout' ? 'Request timed out — retrying…'
+        : isTransientFailure(e) ? 'Reconnecting…' : 'Error: ' + e.message;
     }
   }
 
   const changesCache = new Map(); // submission uuid / 'grp:'+id -> rendered detail HTML
   const groupSubs = new Map();    // group id -> array of submission rows in the group
   const subsByUuid = new Map();   // submission uuid -> last loaded queue row (for meta lookup)
+  let queueSubmissions = [];      // flat loaded history (source of truth for incremental merge)
   let queueDisplayItems = [];
   const selectedQueueUuids = new Set();
   let queueBulkBusy = false;
@@ -288,9 +358,66 @@
   //   QUEUE_MAX_ROWS     — safety ceiling on how many rows we hold in the browser.
   const QUEUE_FETCH_LIMIT = 1000;
   const QUEUE_MAX_ROWS = 25000;
+  const QUEUE_INCREMENTAL_LIMIT = 100;
+  const QUEUE_POLL_INTERVAL_MS = 10000;
   const QUEUE_PAGE_SIZES = [50, 100, 200, 500, 1000];
   const QUEUE_PAGE_STORAGE = 'aps_queue_page_size';
   const queuePageState = { page: 1, pageSize: 200, fetchCapped: false };
+  const queuePollState = { maxId: 0, updatedSince: null, ready: false, inFlight: false, timer: null };
+  let queueLoadInFlight = false;
+  let queueHistoryLoadToken = 0;
+
+  function setQueueBulkStatus(message) {
+    queueBulkMessage = message || '';
+    const el = $('#queueBulkStatus');
+    if (el) el.textContent = queueBulkMessage;
+  }
+
+  async function fetchQueueBatch(beforeId, { timeoutMs = API_BULK_TIMEOUT_MS } = {}) {
+    const qs = new URLSearchParams({ limit: String(QUEUE_FETCH_LIMIT), lite: '1' });
+    if (beforeId != null) qs.set('beforeId', String(beforeId));
+    return api('/admin/queue?' + qs, { timeoutMs });
+  }
+
+  function applyQueueBatch(submissions, data) {
+    const batch = Array.isArray(data.submissions) ? data.submissions : [];
+    syncQueuePollCursor(data.highWaterId);
+    submissions.push(...batch);
+    return {
+      batch,
+      total: typeof data.total === 'number' ? data.total : null,
+      nextBeforeId: data.nextBeforeId || null
+    };
+  }
+
+  async function loadQueueHistoryInBackground(startBeforeId, total, token) {
+    let beforeId = startBeforeId;
+    const submissions = queueSubmissions.slice();
+    try {
+      for (let guard = 0; submissions.length < QUEUE_MAX_ROWS && guard < 1000; guard++) {
+        if (token !== queueHistoryLoadToken) return;
+        const data = await fetchQueueBatch(beforeId);
+        if (token !== queueHistoryLoadToken) return;
+        const { batch, nextBeforeId } = applyQueueBatch(submissions, data);
+        queueSubmissions = submissions;
+        rebuildQueueFromSubmissions(queueSubmissions);
+        queuePageState.fetchCapped = Number.isFinite(total) && submissions.length < total;
+        renderQueueTable();
+        if (total != null) {
+          setQueueBulkStatus(`Loading history… ${submissions.length.toLocaleString()} of ${total.toLocaleString()}`);
+        }
+        if (!nextBeforeId || batch.length < QUEUE_FETCH_LIMIT) break;
+        beforeId = nextBeforeId;
+      }
+      if (token === queueHistoryLoadToken) setQueueBulkStatus('');
+    } catch (_) {
+      if (token === queueHistoryLoadToken) {
+        setQueueBulkStatus(submissions.length
+          ? `Loaded ${submissions.length.toLocaleString()} submissions; older rows still loading — click Refresh to retry.`
+          : '');
+      }
+    }
+  }
   function loadQueuePageSize() {
     try {
       const saved = Number(localStorage.getItem(QUEUE_PAGE_STORAGE));
@@ -1133,57 +1260,154 @@
     return `${batch}||${asin}`;
   }
 
-  async function loadQueue() {
-    const tbody = $('#queueTable tbody');
+  function rebuildQueueFromSubmissions(submissions) {
+    groupSubs.clear();
+    subsByUuid.clear();
+    for (const r of submissions) {
+      if (r.submission_uuid) subsByUuid.set(r.submission_uuid, r);
+    }
+    const order = [];
+    const byKey = new Map();
+    for (const r of submissions) {
+      const key = groupKeyOf(r) || ('solo:' + r.submission_uuid);
+      if (!byKey.has(key)) { const g = { key, items: [] }; byKey.set(key, g); order.push(g); }
+      byKey.get(key).items.push(r);
+    }
+    let gi = 0;
+    queueDisplayItems = order.map((g) => {
+      if (g.key.startsWith('solo:') || g.items.length < 2) {
+        return { type: 'solo', data: g.items[0] };
+      }
+      const id = 'g' + (gi++);
+      groupSubs.set(id, g.items);
+      return { type: 'group', id, items: g.items };
+    });
+  }
+
+  function invalidateQueueChangeCache(uuids) {
+    if (!uuids.length) return;
+    const touched = new Set(uuids);
+    for (const u of touched) changesCache.delete(u);
+    for (const [gid, items] of groupSubs) {
+      if (items.some((i) => touched.has(i.submission_uuid))) changesCache.delete('grp:' + gid);
+    }
+  }
+
+  function mergeQueueRows(incoming) {
+    if (!incoming.length) return false;
+    const indexByUuid = new Map();
+    queueSubmissions.forEach((r, i) => {
+      if (r.submission_uuid) indexByUuid.set(r.submission_uuid, i);
+    });
+    const updatedUuids = [];
+    let changed = false;
+    for (const row of incoming) {
+      const uuid = row.submission_uuid;
+      if (!uuid) continue;
+      const idx = indexByUuid.get(uuid);
+      if (idx !== undefined) {
+        const prev = queueSubmissions[idx];
+        queueSubmissions[idx] = { ...row, _cursorId: row._cursorId ?? prev._cursorId };
+        updatedUuids.push(uuid);
+        changed = true;
+      } else {
+        queueSubmissions.push(row);
+        changed = true;
+      }
+    }
+    if (!changed) return false;
+    queueSubmissions.sort((a, b) => (b._cursorId || 0) - (a._cursorId || 0));
+    invalidateQueueChangeCache(updatedUuids);
+    rebuildQueueFromSubmissions(queueSubmissions);
+    return true;
+  }
+
+  function utcSqliteNow() {
+    return new Date().toISOString().slice(0, 19).replace('T', ' ');
+  }
+
+  function syncQueuePollCursor(highWaterId) {
+    if (typeof highWaterId === 'number' && highWaterId >= queuePollState.maxId) {
+      queuePollState.maxId = highWaterId;
+    }
+    queuePollState.updatedSince = utcSqliteNow();
+  }
+
+  async function pollQueueUpdates() {
+    if (activeTab() !== 'queue' || !queuePollState.ready || queueLoadInFlight || queuePollState.inFlight) return;
+    queuePollState.inFlight = true;
     try {
-      // Pull the whole history in keyset batches (newest -> oldest) until the
-      // server has nothing older, or we hit the in-browser safety ceiling.
-      const submissions = [];
-      let beforeId = null;
-      let total = Infinity;
-      for (let guard = 0; submissions.length < QUEUE_MAX_ROWS && guard < 1000; guard++) {
-        const qs = beforeId == null
-          ? `?limit=${QUEUE_FETCH_LIMIT}`
-          : `?limit=${QUEUE_FETCH_LIMIT}&beforeId=${encodeURIComponent(beforeId)}`;
-        const data = await api('/admin/queue' + qs);
-        const batch = Array.isArray(data.submissions) ? data.submissions : [];
-        if (typeof data.total === 'number') total = data.total;
-        submissions.push(...batch);
-        if (!data.nextBeforeId || batch.length < QUEUE_FETCH_LIMIT) break;
-        beforeId = data.nextBeforeId;
-      }
-      // True only if more rows exist on the server than we loaded (ceiling hit).
-      queuePageState.fetchCapped = Number.isFinite(total) && submissions.length < total;
-      changesCache.clear();
-      groupSubs.clear();
-      subsByUuid.clear();
-      for (const r of submissions) {
-        if (r.submission_uuid) subsByUuid.set(r.submission_uuid, r);
-      }
-      const order = [];
-      const byKey = new Map();
-      for (const r of submissions) {
-        const key = groupKeyOf(r) || ('solo:' + r.submission_uuid);
-        if (!byKey.has(key)) { const g = { key, items: [] }; byKey.set(key, g); order.push(g); }
-        byKey.get(key).items.push(r);
-      }
-      let gi = 0;
-      queueDisplayItems = order.map((g) => {
-        if (g.key.startsWith('solo:') || g.items.length < 2) {
-          return { type: 'solo', data: g.items[0] };
-        }
-        const id = 'g' + (gi++);
-        groupSubs.set(id, g.items);
-        return { type: 'group', id, items: g.items };
+      const qs = new URLSearchParams({
+        afterId: String(queuePollState.maxId),
+        limit: String(QUEUE_INCREMENTAL_LIMIT),
+        lite: '1'
       });
-      queuePageState.page = 1;
-      renderQueueTable();
-    } catch (e) {
-      if (e.message !== '401') {
-        queueDisplayItems = [];
-        tbody.innerHTML = errRow(visibleQueueColCount() || QUEUE_COL_KEYS.length, e);
+      if (queuePollState.updatedSince) qs.set('updatedSince', queuePollState.updatedSince);
+      const data = await api('/admin/queue?' + qs);
+      syncQueuePollCursor(data.highWaterId);
+      const batch = Array.isArray(data.submissions) ? data.submissions : [];
+      if (mergeQueueRows(batch)) {
+        renderQueueTable();
         syncQueueSelectionControls();
       }
+    } catch (e) {
+      if (e.message !== '401') { /* background poll — stay quiet */ }
+    } finally {
+      queuePollState.inFlight = false;
+    }
+  }
+
+  function startQueuePolling() {
+    if (queuePollState.timer) return;
+    queuePollState.timer = setInterval(pollQueueUpdates, QUEUE_POLL_INTERVAL_MS);
+  }
+
+  function stopQueuePolling() {
+    if (!queuePollState.timer) return;
+    clearInterval(queuePollState.timer);
+    queuePollState.timer = null;
+  }
+
+  async function loadQueue() {
+    const tbody = $('#queueTable tbody');
+    queueLoadInFlight = true;
+    queuePollState.ready = false;
+    queueHistoryLoadToken += 1;
+    const historyToken = queueHistoryLoadToken;
+    try {
+      const submissions = [];
+      const data = await fetchQueueBatch(null);
+      const { batch, total, nextBeforeId } = applyQueueBatch(submissions, data);
+      queuePageState.fetchCapped = total != null && submissions.length < total;
+      changesCache.clear();
+      queueSubmissions = submissions;
+      rebuildQueueFromSubmissions(queueSubmissions);
+      queuePageState.page = 1;
+      queuePollState.ready = true;
+      renderQueueTable();
+      syncQueueSelectionControls();
+      if (nextBeforeId && batch.length >= QUEUE_FETCH_LIMIT && submissions.length < QUEUE_MAX_ROWS) {
+        if (total != null) {
+          setQueueBulkStatus(`Loading history… ${submissions.length.toLocaleString()} of ${total.toLocaleString()}`);
+        }
+        loadQueueHistoryInBackground(nextBeforeId, total, historyToken);
+      } else {
+        setQueueBulkStatus('');
+      }
+    } catch (e) {
+      if (e.message !== '401') {
+        if (queueSubmissions.length) {
+          renderQueueTable();
+          setQueueBulkStatus('Could not refresh — showing last loaded rows.');
+        } else {
+          queueSubmissions = [];
+          queueDisplayItems = [];
+          tbody.innerHTML = errRow(visibleQueueColCount() || QUEUE_COL_KEYS.length, e);
+          syncQueueSelectionControls();
+        }
+      }
+    } finally {
+      queueLoadInFlight = false;
     }
   }
 
@@ -2079,6 +2303,7 @@
   const emptyRow = (n) => `<tr><td colspan="${n}" style="text-align:center;color:var(--text-muted);padding:20px;">No rows.</td></tr>`;
   const errRow = (n, e) => {
     const msg = e.message === '401' ? 'Unauthorized'
+      : e.message === 'timeout' ? 'Request timed out — click Refresh to retry.'
       : e.message === '503' ? 'Reconnecting to ListingApp…'
       : esc(e.message);
     return `<tr><td colspan="${n}" style="text-align:center;color:var(--color-neg-text);padding:20px;">${msg}</td></tr>`;
@@ -3016,6 +3241,8 @@
     const view = $('#tab-' + tab);
     if (view) view.classList.remove('hidden');
     try { localStorage.setItem('aps_active_tab', tab); } catch (_) {}
+    if (tab === 'queue') startQueuePolling();
+    else stopQueuePolling();
     loaders[tab]();
   }
 
@@ -3196,6 +3423,19 @@
   loadErrorsView();
   loadErrorColState();
   refreshActive();
+  if (activeTab() === 'queue') startQueuePolling();
   setInterval(loadMetrics, 15000);
   setInterval(loadStatus, 30000);
+  // Retry dashboard panels quickly after a transient outage instead of leaving
+  // the default "Loading…" / "Connecting…" placeholders until the next interval.
+  setInterval(() => {
+    const metricsEl = $('#metricsGrid');
+    const statusEl = $('#statusGrid');
+    const metricsStale = metricsEl && !lastMetricsHtml
+      && (metricsEl.textContent === 'Loading…' || metricsEl.textContent === 'Reconnecting…');
+    const statusStale = statusEl && !lastStatusHtml
+      && (statusEl.textContent === 'Connecting…' || statusEl.textContent === 'Reconnecting…');
+    if (metricsStale) loadMetrics();
+    if (statusStale) loadStatus();
+  }, 5000);
 })();

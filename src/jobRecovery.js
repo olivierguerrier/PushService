@@ -8,6 +8,8 @@ const approvalQueue = require('./approvalQueue');
 const audit = require('./audit/auditEvents');
 const { recomputeJobStatus } = require('./jobOrchestrator');
 
+const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
+
 function listInterruptedForwards() {
   return getDb().prepare(`
     SELECT * FROM push_submissions
@@ -33,6 +35,25 @@ function resumeInterruptedForwards() {
   return summary;
 }
 
+async function resumeInterruptedForwardsAsync({ batchSize = 25 } = {}) {
+  const rows = listInterruptedForwards();
+  const summary = { scanned: rows.length, resumed: 0 };
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    audit.record({
+      event: 'submission_resumed_at_boot',
+      submissionUuid: row.submission_uuid,
+      jobUuid: row.job_uuid,
+      actor: 'system',
+      details: { operation: row.operation }
+    });
+    approvalQueue.enqueue(row);
+    summary.resumed += 1;
+    if ((i + 1) % batchSize === 0) await yieldToEventLoop();
+  }
+  return summary;
+}
+
 function recomputeOpenJobs() {
   const openJobs = getDb().prepare(`
     SELECT job_uuid FROM push_jobs WHERE status IN ('pending', 'running')
@@ -45,4 +66,23 @@ function recomputeOpenJobs() {
   return { recomputed };
 }
 
-module.exports = { listInterruptedForwards, resumeInterruptedForwards, recomputeOpenJobs };
+async function recomputeOpenJobsAsync({ batchSize = 25 } = {}) {
+  const openJobs = getDb().prepare(`
+    SELECT job_uuid FROM push_jobs WHERE status IN ('pending', 'running')
+  `).all();
+  let recomputed = 0;
+  for (let i = 0; i < openJobs.length; i++) {
+    recomputeJobStatus(openJobs[i].job_uuid);
+    recomputed += 1;
+    if ((i + 1) % batchSize === 0) await yieldToEventLoop();
+  }
+  return { recomputed };
+}
+
+module.exports = {
+  listInterruptedForwards,
+  resumeInterruptedForwards,
+  resumeInterruptedForwardsAsync,
+  recomputeOpenJobs,
+  recomputeOpenJobsAsync
+};

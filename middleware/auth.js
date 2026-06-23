@@ -51,30 +51,83 @@ function bearerAuth(req, res, next) {
 // authenticated request hits the LA bridge; TTL kept short so a
 // demote/deactivate in ListingApp takes effect within seconds.
 const USER_CACHE_TTL_MS = 30 * 1000;
+const LA_CIRCUIT_MS = 30 * 1000;
 const userCache = new Map(); // id -> { row, expiresAt }
+const userRefreshInflight = new Map(); // id -> Promise<void>
+let laCircuitOpenUntil = 0;
+
+function seedUserCache(user) {
+  if (!user || user.id == null) return;
+  userCache.set(user.id, { row: user, expiresAt: Date.now() + USER_CACHE_TTL_MS });
+}
+
+function tripLaCircuit() {
+  laCircuitOpenUntil = Date.now() + LA_CIRCUIT_MS;
+}
+
+function trimUserCache() {
+  if (userCache.size <= 500) return;
+  const firstKey = userCache.keys().next().value;
+  userCache.delete(firstKey);
+}
+
+async function refreshUserCache(id) {
+  if (Date.now() < laCircuitOpenUntil) {
+    const err = new Error('ListingApp unavailable (circuit open)');
+    err.code = 'LA_CIRCUIT_OPEN';
+    throw err;
+  }
+  try {
+    const row = await listingAppClient.getUser(id);
+    userCache.set(id, { row, expiresAt: Date.now() + USER_CACHE_TTL_MS });
+    trimUserCache();
+    return row;
+  } catch (err) {
+    tripLaCircuit();
+    throw err;
+  }
+}
+
+function scheduleUserRefresh(id) {
+  if (userRefreshInflight.has(id)) return;
+  const p = refreshUserCache(id)
+    .catch(() => {})
+    .finally(() => userRefreshInflight.delete(id));
+  userRefreshInflight.set(id, p);
+}
+
+function userForRequest(id) {
+  const now = Date.now();
+  const hit = userCache.get(id);
+  if (hit && hit.expiresAt > now) return { known: true, row: hit.row };
+  if (hit && hit.row) {
+    scheduleUserRefresh(id);
+    return { known: true, row: hit.row };
+  }
+  scheduleUserRefresh(id);
+  return { known: false, row: null };
+}
 
 async function findActiveUserByIdCached(id) {
   const now = Date.now();
   const hit = userCache.get(id);
   if (hit && hit.expiresAt > now) return hit.row;
-  let row;
+
+  // Stale-while-revalidate: serve last-known-good immediately and refresh in
+  // the background. Previously we blocked every request for up to ~10s while
+  // getUser timed out on each cache expiry, leaving the console stuck on
+  // "Not connected." even though the JWT was still valid.
+  if (hit && hit.row) {
+    scheduleUserRefresh(id);
+    return hit.row;
+  }
+
   try {
-    row = await listingAppClient.getUser(id);
+    return await refreshUserCache(id);
   } catch (err) {
-    // ListingApp bridge unreachable. Rather than fail the re-check, serve the
-    // last-known-good row (even though its 30s freshness window lapsed) so a
-    // transient outage doesn't 503 every authenticated request. Re-throw only
-    // when we have never seen this user — the caller then decides whether to
-    // grace-trust the signed JWT.
     if (hit) return hit.row;
     throw err;
   }
-  userCache.set(id, { row, expiresAt: now + USER_CACHE_TTL_MS });
-  if (userCache.size > 500) {
-    const firstKey = userCache.keys().next().value;
-    userCache.delete(firstKey);
-  }
-  return row;
 }
 
 // Verify ListingApp credentials over the bridge. Returns the user row on
@@ -127,17 +180,12 @@ async function adminAuth(req, res, next) {
         req.admin = payload;
         return next();
       }
-      let current;
-      try {
-        current = await findActiveUserByIdCached(payload.id);
-      } catch (dbErr) {
-        // ListingApp is unreachable and we have no cached row to consult. The
-        // JWT itself is already verified and still within its TTL, so grace-
-        // trust it instead of 503-ing every request during an LA outage —
-        // otherwise a brief bridge blip locks every operator out of a console
-        // they're legitimately signed into. Exposure stays bounded by the JWT
-        // expiry, and a real deactivate is enforced the moment LA recovers.
-        console.warn('[AUTH] user lookup failed, grace-trusting valid JWT until expiry:', dbErr.message);
+      const { known, row: current } = userForRequest(payload.id);
+      if (!known) {
+        // Cold server / ListingApp outage: the JWT is already verified and
+        // bounded by its expiry, so do not make the operator console wait on
+        // the bridge. A background refresh will enforce disables/role changes
+        // as soon as ListingApp answers.
         req.admin = payload;
         return next();
       }
@@ -184,6 +232,12 @@ function parseCookies(req) {
   return out;
 }
 
+function resetUserCache() {
+  userCache.clear();
+  userRefreshInflight.clear();
+  laCircuitOpenUntil = 0;
+}
+
 module.exports = {
   bearerAuth,
   adminAuth,
@@ -192,5 +246,7 @@ module.exports = {
   verifyCredentials,
   requireRole,
   findActiveUserByIdCached,
+  seedUserCache,
+  resetUserCache,
   TOKEN_TTL_SECONDS
 };

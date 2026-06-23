@@ -34,26 +34,35 @@ function activeThroughputStart() {
   const settledPh = SETTLED_SUB_STATUSES.map(() => '?').join(', ');
   const activePh = ACTIVE_SUB_STATUSES.map(() => '?').join(', ');
   const row = db.prepare(`
-    SELECT MIN(COALESCE(j.started_at, j.created_at)) AS started
-    FROM push_jobs j
-    WHERE j.created_at >= datetime('now', ?)
-      AND (
-        j.status IN ('pending', 'running')
-        OR EXISTS (
-          SELECT 1 FROM push_submissions s
-          WHERE s.job_uuid = j.job_uuid
-            AND (
-              s.status IN (${activePh})
-              OR (
-                s.status IN (${settledPh})
-                AND s.updated_at >= datetime('now', ?)
-              )
-            )
-        )
-      )
+    SELECT MIN(started) AS started
+    FROM (
+      SELECT COALESCE(j.started_at, j.created_at) AS started
+      FROM push_jobs j
+      WHERE j.created_at >= datetime('now', ?)
+        AND j.status IN ('pending', 'running')
+
+      UNION ALL
+
+      SELECT COALESCE(j.started_at, j.created_at) AS started
+      FROM push_submissions s
+      INNER JOIN push_jobs j ON j.job_uuid = s.job_uuid
+      WHERE j.created_at >= datetime('now', ?)
+        AND s.status IN (${activePh})
+
+      UNION ALL
+
+      SELECT COALESCE(j.started_at, j.created_at) AS started
+      FROM push_submissions s
+      INNER JOIN push_jobs j ON j.job_uuid = s.job_uuid
+      WHERE j.created_at >= datetime('now', ?)
+        AND s.status IN (${settledPh})
+        AND s.updated_at >= datetime('now', ?)
+    )
   `).get(
     `-${DASHBOARD_WINDOW_HOURS} hours`,
+    `-${DASHBOARD_WINDOW_HOURS} hours`,
     ...ACTIVE_SUB_STATUSES,
+    `-${DASHBOARD_WINDOW_HOURS} hours`,
     ...SETTLED_SUB_STATUSES,
     `-${THROUGHPUT_WINDOW_MIN} minutes`
   );
@@ -186,4 +195,41 @@ function getDashboard() {
   };
 }
 
-module.exports = { getDashboard, THROUGHPUT_WINDOW_MIN, DASHBOARD_WINDOW_HOURS };
+function emptyDashboard() {
+  const jobs24h = { total: 0, running: 0, pending: 0, completed: 0, partial: 0, failed: 0, finished: 0 };
+  const progress24h = {
+    total: 0,
+    done: 0,
+    remaining: 0,
+    active: 0,
+    pendingApproval: 0,
+    inFlight: 0,
+    ok: 0,
+    failed: 0,
+    percent: 0
+  };
+  return {
+    windowHours: DASHBOARD_WINDOW_HOURS,
+    jobs24h,
+    jobsRunning: 0,
+    jobsPending: 0,
+    submissionsActive: 0,
+    submissionsPendingApproval: 0,
+    submissionsInFlight: 0,
+    progress24h,
+    progress: progress24h,
+    throughput: {
+      windowMinutes: THROUGHPUT_WINDOW_MIN,
+      sinceStart: false,
+      settled: 0,
+      perMinute: 0
+    },
+    eta: {
+      remaining: 0,
+      seconds: null,
+      available: false
+    }
+  };
+}
+
+module.exports = { getDashboard, emptyDashboard, THROUGHPUT_WINDOW_MIN, DASHBOARD_WINDOW_HOURS };

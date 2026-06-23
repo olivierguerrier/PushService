@@ -52,6 +52,18 @@ function buildApp() {
   app.use(rateLimit({ windowMs: 60_000, max: 600, standardHeaders: true, legacyHeaders: false }));
   const writeLimiter = rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
 
+  app.use((req, res, next) => {
+    if (!req.path.startsWith('/admin/')) return next();
+    const start = process.hrtime.bigint();
+    res.on('finish', () => {
+      const ms = Number(process.hrtime.bigint() - start) / 1e6;
+      if (req.path === '/admin/metrics' || ms > 1000) {
+        console.log(`[admin] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms.toFixed(1)}ms`);
+      }
+    });
+    next();
+  });
+
   // Public + operator endpoints.
   app.use('/', adminRoutes);
   app.use('/approve', approvalRoutes);
@@ -157,7 +169,7 @@ async function main() {
   // Boot-time recovery: resume interrupted forwards, continue incomplete fan-outs,
   // close only legacy stuck jobs, refresh open rollups, then poll in-flight feeds.
   try {
-    const resumed = jobRecovery.resumeInterruptedForwards();
+    const resumed = await jobRecovery.resumeInterruptedForwardsAsync();
     if (resumed.resumed) console.log(`[boot] resumed ${resumed.resumed}/${resumed.scanned} interrupted submission(s)`);
   } catch (err) { console.warn('[boot] submission resume failed:', err.message); }
   try {
@@ -165,13 +177,13 @@ async function main() {
     if (fanout.resumed) console.log(`[boot] resumed fan-out on ${fanout.resumed} job(s), ${fanout.processedTargets} target(s)`);
   } catch (err) { console.warn('[boot] fan-out resume failed:', err.message); }
   try {
-    const recovered = jobs.recoverStuckJobs({ staleAfterMinutes: env.JOB_STALE_MINUTES });
+    const recovered = await jobs.recoverStuckJobsAsync({ staleAfterMinutes: env.JOB_STALE_MINUTES });
     if (recovered.recovered) console.log(`[boot] closed ${recovered.recovered}/${recovered.scanned} legacy incomplete job(s)`);
     if (recovered.leftOpen) console.log(`[boot] left ${recovered.leftOpen} resumable job(s) open`);
     if (recovered.recomputed) console.log(`[boot] recomputed ${recovered.recomputed} open job(s)`);
   } catch (err) { console.warn('[boot] job recovery failed:', err.message); }
   try {
-    const { recomputed } = jobRecovery.recomputeOpenJobs();
+    const { recomputed } = await jobRecovery.recomputeOpenJobsAsync();
     if (recomputed) console.log(`[boot] refreshed ${recomputed} open job rollup(s)`);
   } catch (err) { console.warn('[boot] job rollup refresh failed:', err.message); }
 

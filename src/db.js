@@ -44,6 +44,7 @@ function ensureSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_push_jobs_status ON push_jobs(status, created_at);
     CREATE INDEX IF NOT EXISTS idx_push_jobs_asin ON push_jobs(asin, marketplace_code);
+    CREATE INDEX IF NOT EXISTS idx_push_jobs_created ON push_jobs(created_at);
 
     CREATE TABLE IF NOT EXISTS push_submissions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +81,9 @@ function ensureSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_push_sub_job ON push_submissions(job_uuid);
     CREATE INDEX IF NOT EXISTS idx_push_sub_approval ON push_submissions(approval_token);
     CREATE INDEX IF NOT EXISTS idx_push_sub_created ON push_submissions(created_at);
+    CREATE INDEX IF NOT EXISTS idx_push_sub_status_updated ON push_submissions(status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_push_sub_job_status_updated ON push_submissions(job_uuid, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_push_sub_updated_id ON push_submissions(updated_at DESC, id DESC);
 
     CREATE TABLE IF NOT EXISTS audit_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

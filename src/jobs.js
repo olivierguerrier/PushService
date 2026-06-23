@@ -5,6 +5,8 @@
 const { getDb } = require('./db');
 const audit = require('./audit/auditEvents');
 
+const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
+
 function safeJson(v) {
   if (v == null) return null;
   try { return JSON.parse(v); } catch { return null; }
@@ -208,4 +210,68 @@ function recoverStuckJobs({ staleAfterMinutes = 15 } = {}) {
   return summary;
 }
 
-module.exports = { create, update, getByUuid, list, listAll, count, recoverStuckJobs };
+async function recoverStuckJobsAsync({ staleAfterMinutes = 15, batchSize = 25 } = {}) {
+  const { recomputeJobStatus } = require('./jobOrchestrator');
+  const { hasResumableTargets } = require('./jobFanOutResume');
+  const db = getDb();
+  const cutoffIso = new Date(Date.now() - staleAfterMinutes * 60 * 1000).toISOString();
+  const stuck = db.prepare(`
+    SELECT j.job_uuid, j.status, j.ok_count, j.failed_count, j.target_count, j.started_at, j.created_at,
+           j.request_payload_json,
+           (SELECT COUNT(*) FROM push_submissions s WHERE s.job_uuid = j.job_uuid) AS submission_count
+    FROM push_jobs j
+    WHERE j.status IN ('pending', 'running') AND COALESCE(j.started_at, j.created_at) < ?
+  `).all(cutoffIso);
+  const summary = { scanned: stuck.length, recovered: 0, recomputed: 0, leftOpen: 0 };
+  for (let i = 0; i < stuck.length; i++) {
+    const row = stuck[i];
+    const submissionCount = Number(row.submission_count) || 0;
+    const target = Number(row.target_count) || 0;
+    if (submissionCount >= target) {
+      try {
+        recomputeJobStatus(row.job_uuid);
+        summary.recomputed += 1;
+      } catch (err) {
+        console.warn(`[jobs] failed to recompute job ${row.job_uuid}: ${err.message}`);
+      }
+      if ((i + 1) % batchSize === 0) await yieldToEventLoop();
+      continue;
+    }
+    if (hasResumableTargets(row.request_payload_json)) {
+      try {
+        recomputeJobStatus(row.job_uuid);
+        summary.leftOpen += 1;
+      } catch (err) {
+        console.warn(`[jobs] failed to recompute resumable job ${row.job_uuid}: ${err.message}`);
+      }
+      if ((i + 1) % batchSize === 0) await yieldToEventLoop();
+      continue;
+    }
+    const counts = db.prepare(`
+      SELECT
+        SUM(CASE WHEN status = 'APPLIED' THEN 1 ELSE 0 END) AS ok,
+        SUM(CASE WHEN status IN ('FAILED', 'REJECTED', 'EXPIRED', 'BLOCKED') THEN 1 ELSE 0 END) AS failed
+      FROM push_submissions WHERE job_uuid = ?
+    `).get(row.job_uuid);
+    const ok = Number(counts && counts.ok) || 0;
+    const failed = Number(counts && counts.failed) || 0;
+    const newStatus = ok > 0 ? 'partial' : 'failed';
+    const remaining = Math.max(0, target - ok - failed);
+    try {
+      update(row.job_uuid, {
+        status: newStatus,
+        failed_count: failed + remaining,
+        completed_at: new Date().toISOString(),
+        error_message: `Recovered at boot: process died mid-fan-out (was '${row.status}', ${submissionCount}/${target} targets).`
+      });
+      audit.record({ event: 'job_recovered_at_boot', jobUuid: row.job_uuid, actor: 'system', details: { previous_status: row.status, new_status: newStatus, submission_count: submissionCount, target_count: target } });
+      summary.recovered += 1;
+    } catch (err) {
+      console.warn(`[jobs] failed to recover stuck job ${row.job_uuid}: ${err.message}`);
+    }
+    if ((i + 1) % batchSize === 0) await yieldToEventLoop();
+  }
+  return summary;
+}
+
+module.exports = { create, update, getByUuid, list, listAll, count, recoverStuckJobs, recoverStuckJobsAsync };

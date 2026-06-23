@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const env = require('../config/env');
-const { adminAuth, serviceTokens, signAdminJwt, verifyCredentials, TOKEN_TTL_SECONDS } = require('../middleware/auth');
+const { adminAuth, serviceTokens, signAdminJwt, verifyCredentials, seedUserCache, TOKEN_TTL_SECONDS } = require('../middleware/auth');
 const { writeGate } = require('../middleware/writeGate');
 const submissions = require('../src/submissions');
 const errorReport = require('../src/errorReport');
@@ -88,6 +88,7 @@ router.post('/admin/login', loginLimiter, express.json(), async (req, res) => {
       console.warn(`[AUTH] login failed ip=${peerIp} user=${username.slice(0, 80)}`);
       return res.status(401).json({ error: 'invalid_credentials' });
     }
+    seedUserCache(user);
     const jwtToken = signAdminJwt(user);
     setSessionCookie(res, jwtToken);
     console.log(`[AUTH] login ok ip=${peerIp} user=${user.username} role=${user.role}`);
@@ -109,16 +110,101 @@ router.get('/admin/me', adminAuth, (req, res) => {
   res.json({ user: req.admin || (req.caller ? { username: req.caller, role: 'service' } : null) });
 });
 
-router.get('/admin/metrics', adminAuth, (req, res) => {
-  res.json({
+const METRICS_CACHE_MS = 10_000;
+let metricsCache = null; // { at, value }
+let metricsInflight = false;
+
+function buildMetricsSnapshot() {
+  return {
     ...metrics.getDashboard(),
     approvalQueueDepth: approvalQueue.size()
+  };
+}
+
+function scheduleMetricsRefresh() {
+  if (metricsInflight) return;
+  metricsInflight = true;
+  setImmediate(() => {
+    try {
+      metricsCache = { at: Date.now(), value: buildMetricsSnapshot() };
+    } catch (err) {
+      console.warn('[metrics] refresh failed:', err.message);
+    } finally {
+      metricsInflight = false;
+    }
   });
+}
+
+function metricsSnapshot() {
+  const now = Date.now();
+  if (metricsCache && now - metricsCache.at < METRICS_CACHE_MS) return metricsCache.value;
+  scheduleMetricsRefresh();
+  if (metricsCache) return { ...metricsCache.value, stale: true, refreshing: true };
+  return {
+    ...metrics.emptyDashboard(),
+    approvalQueueDepth: approvalQueue.size(),
+    refreshing: true
+  };
+}
+
+router.get('/admin/metrics', adminAuth, (req, res) => {
+  res.json(metricsSnapshot());
 });
 
-router.get('/admin/status', adminAuth, async (req, res) => {
-  let listingApp = null;
-  try { listingApp = await la.checkHealth(); } catch (err) { listingApp = { ok: false, reason: err.message }; }
+const LISTINGAPP_HEALTH_CACHE_MS = 30_000;
+let listingAppHealthCache = null; // { at, value }
+let listingAppHealthInflight = false;
+const AUDIT_CHAIN_CACHE_MS = 60_000;
+let auditChainCache = null; // { at, value }
+let auditChainInflight = false;
+
+function scheduleListingAppHealthRefresh() {
+  if (listingAppHealthInflight) return;
+  listingAppHealthInflight = true;
+  setImmediate(async () => {
+    let listingApp = null;
+    try { listingApp = await la.checkHealth(); } catch (err) { listingApp = { ok: false, reason: err.message }; }
+    listingAppHealthCache = { at: Date.now(), value: listingApp };
+    listingAppHealthInflight = false;
+  });
+}
+
+function listingAppHealthSnapshot() {
+  const now = Date.now();
+  if (listingAppHealthCache && now - listingAppHealthCache.at < LISTINGAPP_HEALTH_CACHE_MS) {
+    return listingAppHealthCache.value;
+  }
+  scheduleListingAppHealthRefresh();
+  return listingAppHealthCache
+    ? listingAppHealthCache.value
+    : { ok: false, configured: la.isConfigured(), reason: 'checking' };
+}
+
+function scheduleAuditChainRefresh() {
+  if (auditChainInflight) return;
+  auditChainInflight = true;
+  setImmediate(() => {
+    try {
+      auditChainCache = { at: Date.now(), value: audit.verifyChain() };
+    } catch (err) {
+      auditChainCache = { at: Date.now(), value: { ok: false, checked: 0, brokenAtId: null, reason: err.message } };
+    } finally {
+      auditChainInflight = false;
+    }
+  });
+}
+
+function auditChainSnapshot() {
+  const now = Date.now();
+  if (auditChainCache && now - auditChainCache.at < AUDIT_CHAIN_CACHE_MS) {
+    return auditChainCache.value;
+  }
+  scheduleAuditChainRefresh();
+  return auditChainCache ? auditChainCache.value : { ok: true, checked: 0, brokenAtId: null, pending: true };
+}
+
+router.get('/admin/status', adminAuth, (req, res) => {
+  const listingApp = listingAppHealthSnapshot();
   res.json({
     version: env.VERSION,
     writesEnabled: env.SPAPI_WRITES_ENABLED,
@@ -131,7 +217,7 @@ router.get('/admin/status', adminAuth, async (req, res) => {
     contentSource: contentSource.describe(),
     callersConfigured: serviceTokens().size,
     approversConfigured: env.APPROVERS.length,
-    auditChain: audit.verifyChain()
+    auditChain: auditChainSnapshot()
   });
 });
 
@@ -141,25 +227,51 @@ router.get('/admin/status', adminAuth, async (req, res) => {
 // Excel export via src/errorReport.
 const summarizeErrorDetails = errorReport.summarizeErrorDetails;
 
-// Recent submissions for the console. Supports keyset pagination so the UI can
-// load the full history in batches: pass `beforeId` (the `nextBeforeId` from the
-// previous response) to fetch the next, older page. `total` lets the client know
-// when it has everything. The internal autoincrement `id` is used only as the
-// pagination cursor and is stripped from the per-row payload.
-router.get('/admin/queue', adminAuth, (req, res) => {
-  const beforeId = req.query.beforeId != null && req.query.beforeId !== '' ? Number(req.query.beforeId) : null;
-  const raw = submissions.listRecent({ limit: req.query.limit || 200, beforeId });
-  const rows = raw.map((r) => {
+function formatQueueRows(raw, { lite = false } = {}) {
+  return raw.map((r) => {
     const { id, flyapp_meta_json, issues_json, amazon_response_json, ...rest } = r;
     let meta = null;
     if (flyapp_meta_json) {
       try { meta = JSON.parse(flyapp_meta_json); } catch (_) { meta = null; }
     }
-    const errorDetails = summarizeErrorDetails({ issues_json, amazon_response_json });
-    return { ...rest, meta, errorDetails };
+    const errorDetails = lite ? [] : summarizeErrorDetails({ issues_json, amazon_response_json });
+    return { ...rest, meta, errorDetails, _cursorId: id };
   });
+}
+
+// Recent submissions for the console. Supports keyset pagination so the UI can
+// load the full history in batches: pass `beforeId` (the `nextBeforeId` from the
+// previous response) to fetch the next, older page. `total` lets the client know
+// when it has everything. Pass `afterId` (+ optional `updatedSince`) for
+// incremental refresh of new / changed rows without reloading the full history.
+router.get('/admin/queue', adminAuth, (req, res) => {
+  const beforeId = req.query.beforeId != null && req.query.beforeId !== '' ? Number(req.query.beforeId) : null;
+  const afterId = req.query.afterId != null && req.query.afterId !== '' ? Number(req.query.afterId) : null;
+  const updatedSince = req.query.updatedSince || null;
+  const highWaterId = submissions.maxId();
+
+  if (afterId != null && Number.isFinite(afterId)) {
+    if (beforeId != null && Number.isFinite(beforeId)) {
+      return res.status(400).json({ error: 'invalid_pagination', message: 'Use beforeId or afterId, not both' });
+    }
+    const raw = submissions.listChanges({
+      afterId,
+      updatedSince,
+      limit: req.query.limit || 100
+    });
+    const lite = req.query.lite === '1' || req.query.lite === 'true';
+    return res.json({
+      submissions: formatQueueRows(raw, { lite }),
+      highWaterId,
+      incremental: true
+    });
+  }
+
+  const raw = submissions.listRecent({ limit: req.query.limit || 200, beforeId });
+  const lite = req.query.lite === '1' || req.query.lite === 'true';
+  const rows = formatQueueRows(raw, { lite });
   const nextBeforeId = raw.length ? raw[raw.length - 1].id : null;
-  res.json({ submissions: rows, total: submissions.count(), nextBeforeId });
+  res.json({ submissions: rows, total: submissions.count(), nextBeforeId, highWaterId });
 });
 
 // Per-field change details for one submission: flyapp source value -> submitted

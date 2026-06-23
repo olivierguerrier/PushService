@@ -120,6 +120,40 @@ function count() {
   return getDb().prepare('SELECT COUNT(*) AS n FROM push_submissions').get().n;
 }
 
+function maxId() {
+  return getDb().prepare('SELECT COALESCE(MAX(id), 0) AS m FROM push_submissions').get().m;
+}
+
+// Incremental console refresh: rows newer than `afterId`, plus already-loaded rows
+// whose updated_at moved past `updatedSince`. Merged and deduped by id, newest first.
+function listChanges({ afterId, updatedSince = null, limit = 100 } = {}) {
+  const after = Number(afterId);
+  if (!Number.isFinite(after)) return [];
+  const cap = Math.max(1, Math.min(1000, Number(limit) || 100));
+  const cols = `id, submission_uuid, job_uuid, caller, scope, operation, vendor_code, sku,
+           parent_sku, effective_sku, asin, item_number, marketplace_code, status,
+           approved_by, approved_at,
+           error_message, issues_json, amazon_response_json, created_at, updated_at,
+           flyapp_meta_json, approver_comment`;
+  const byId = new Map();
+  const newer = getDb().prepare(`
+    SELECT ${cols} FROM push_submissions WHERE id > ? ORDER BY id DESC LIMIT ${cap}
+  `).all(after);
+  for (const r of newer) byId.set(r.id, r);
+  if (updatedSince) {
+    const remaining = cap - byId.size;
+    if (remaining > 0) {
+      const updated = getDb().prepare(`
+        SELECT ${cols} FROM push_submissions
+        WHERE id <= ? AND updated_at > ?
+        ORDER BY updated_at DESC, id DESC LIMIT ${remaining}
+      `).all(after, updatedSince);
+      for (const r of updated) byId.set(r.id, r);
+    }
+  }
+  return [...byId.values()].sort((a, b) => b.id - a.id);
+}
+
 function listForJob(jobUuid) {
   return getDb().prepare('SELECT * FROM push_submissions WHERE job_uuid = ? ORDER BY id ASC').all(jobUuid);
 }
@@ -166,4 +200,7 @@ function setArchived(uuid, { archived = true, actor = null } = {}) {
   return getByUuid(uuid);
 }
 
-module.exports = { insert, getByUuid, getByIdempotencyKey, getByApprovalToken, update, listRecent, count, listForJob, listErrors, setArchived };
+module.exports = {
+  insert, getByUuid, getByIdempotencyKey, getByApprovalToken, update,
+  listRecent, listChanges, count, maxId, listForJob, listErrors, setArchived
+};
