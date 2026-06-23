@@ -143,6 +143,7 @@ function ensureSchema(db) {
       operation TEXT,
       proposed_package_json TEXT,
       changed_attr_names_json TEXT,
+      value_sources_json TEXT,
       unresolved_json TEXT,
       warnings_json TEXT,
       validation_json TEXT,
@@ -212,6 +213,12 @@ function migrateColumns(db) {
       // row still appears in the Errors tab marked as archived. NULL = active.
       { name: 'archived_at', ddl: 'archived_at TEXT' },
       { name: 'archived_by', ddl: 'archived_by TEXT' }
+    ],
+    ai_resolutions: [
+      // Provenance map: Amazon attribute name -> the source field/path the model
+      // read the value from (e.g. "item_weight" -> "pim_raw.package_weight_lb").
+      // Lets a reviewer confirm every emitted value traces to real Battat data.
+      { name: 'value_sources_json', ddl: 'value_sources_json TEXT' }
     ]
   };
   for (const [table, cols] of Object.entries(ADDITIONS)) {

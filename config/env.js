@@ -208,9 +208,10 @@ module.exports = {
   get OPENAI_API_KEY() { return str('OPENAI_API_KEY'); },
   get OPENAI_MODEL() { return str('OPENAI_MODEL', 'gpt-5.4-mini'); },
   get OPENAI_RESOLVER_ENABLED() {
-    // Default ON whenever a key is configured; an explicit false disables it.
-    if (!str('OPENAI_API_KEY')) return false;
-    return bool('OPENAI_RESOLVER_ENABLED', true);
+    // Default ON whenever a key is available inline or via ControlTower vault.
+    if (!bool('OPENAI_RESOLVER_ENABLED', true)) return false;
+    if (str('OPENAI_API_KEY')) return true;
+    return vaultBootstrap.vault.isConfigured();
   },
 
   // Poller

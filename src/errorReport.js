@@ -2,6 +2,7 @@
 // Submissions queue, the Errors tab, and the Excel export all need the same
 // view of "what went wrong" so the logic lives here once.
 const submissions = require('./submissions');
+const errorTranslation = require('./errorTranslation');
 
 // Excel rejects cell text longer than 32,767 chars; keep a small margin.
 const CELL_MAX = 32000;
@@ -77,31 +78,40 @@ function toRecord(row) {
 // Flatten a submission into >=1 spreadsheet rows — one per Amazon issue so each
 // error code lands on its own line. Submissions with no distilled issue still
 // emit a single row carrying the error_message so nothing is dropped.
-function toExportRows(row) {
-  const details = summarizeErrorDetails(row);
-  const raw = row.amazon_response_json ? String(row.amazon_response_json).slice(0, CELL_MAX) : '';
+function toExportRows(record) {
+  const details = record.errorDetails || [];
+  const detailsEn = record.errorDetailsEn || [];
+  const raw = record.rawResponse ? String(record.rawResponse).slice(0, CELL_MAX) : '';
   const base = {
-    created_at: row.created_at || '',
-    updated_at: row.updated_at || '',
-    submission_uuid: row.submission_uuid || '',
-    job_uuid: row.job_uuid || '',
-    status: row.status || '',
-    caller: row.caller || '',
-    vendor_code: row.vendor_code || '',
-    sku: row.sku || '',
-    effective_sku: row.effective_sku || '',
-    asin: row.asin || '',
-    item_number: row.item_number || '',
-    marketplace_code: row.marketplace_code || '',
-    product_type: row.product_type || '',
-    operation: row.operation || '',
-    scope: row.scope || '',
-    approved_by: row.approved_by || '',
-    feed_id: row.feed_id || '',
-    error_message: row.error_message || ''
+    created_at: record.created_at || '',
+    updated_at: record.updated_at || '',
+    submission_uuid: record.submission_uuid || '',
+    job_uuid: record.job_uuid || '',
+    status: record.status || '',
+    caller: record.caller || '',
+    vendor_code: record.vendor_code || '',
+    sku: record.sku || '',
+    effective_sku: record.effective_sku || '',
+    asin: record.asin || '',
+    item_number: record.item_number || '',
+    marketplace_code: record.marketplace_code || '',
+    product_type: record.product_type || '',
+    operation: record.operation || '',
+    scope: record.scope || '',
+    approved_by: record.approved_by || '',
+    feed_id: record.feed_id || '',
+    error_message: record.error_message || '',
+    error_message_en: record.error_message_en || ''
   };
   if (!details.length) {
-    return [Object.assign({}, base, { severity: '', code: '', issue_message: row.error_message || '', attribute_names: '', raw_response: raw })];
+    return [Object.assign({}, base, {
+      severity: '',
+      code: '',
+      issue_message: record.error_message || '',
+      issue_message_en: record.error_message_en || '',
+      attribute_names: '',
+      raw_response: raw
+    })];
   }
   // Attach the raw envelope only to the first issue row to avoid repeating a
   // large blob on every line of the same submission.
@@ -109,6 +119,7 @@ function toExportRows(row) {
     severity: d.severity || '',
     code: d.code || '',
     issue_message: d.message || '',
+    issue_message_en: detailsEn[idx] || errorTranslation.formatErrorDetail(d),
     attribute_names: (d.attributeNames || []).join(', '),
     raw_response: idx === 0 ? raw : ''
   }));
@@ -122,8 +133,10 @@ const EXPORT_COLUMNS = [
   { header: 'Issue severity', key: 'severity', width: 14 },
   { header: 'Issue code', key: 'code', width: 18 },
   { header: 'Issue message', key: 'issue_message', width: 60 },
+  { header: 'Issue message (English)', key: 'issue_message_en', width: 60 },
   { header: 'Attributes', key: 'attribute_names', width: 24 },
   { header: 'Error summary', key: 'error_message', width: 40 },
+  { header: 'Error summary (English)', key: 'error_message_en', width: 40 },
   { header: 'ASIN', key: 'asin', width: 14 },
   { header: 'SKU', key: 'sku', width: 18 },
   { header: 'Effective SKU', key: 'effective_sku', width: 18 },
@@ -145,8 +158,10 @@ const EXPORT_COLUMNS = [
 async function buildWorkbook({ limit } = {}) {
   const ExcelJS = require('exceljs');
   const rows = listErrorSubmissions({ limit });
+  const records = rows.map(toRecord);
+  await errorTranslation.enrichRecords(records);
   const exportRows = [];
-  for (const r of rows) exportRows.push(...toExportRows(r));
+  for (const r of records) exportRows.push(...toExportRows(r));
 
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Amazon Push Service';

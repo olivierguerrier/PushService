@@ -9,6 +9,7 @@
 const productTypes = require('../spapi/productTypes');
 const { resolveByCode } = require('../../config/marketplaces');
 const { languageTagFor } = require('../../config/languages');
+const units = require('../units');
 
 function safeJson(v) {
   if (v == null) return null;
@@ -100,23 +101,26 @@ function pickNumber(v) {
   const n = Number(v);
   return Number.isFinite(n) ? Math.round(n * 1000) / 1000 : null;
 }
-function envelopeDimensions(dim, { marketplaceId }) {
+// Source dimensions are inches; convert to the marketplace unit system.
+function envelopeDimensions(dim, { marketplaceId, units: unitSystem }) {
   if (!dim) return null;
   const length = pickNumber(dim.length);
   const width = pickNumber(dim.width);
   const height = pickNumber(dim.height);
   if (length == null && width == null && height == null) return null;
+  const unit = units.lengthUnit(unitSystem);
   const entry = { marketplace_id: marketplaceId };
-  if (length != null) entry.length = { value: length, unit: 'inches' };
-  if (width != null) entry.width = { value: width, unit: 'inches' };
-  if (height != null) entry.height = { value: height, unit: 'inches' };
+  if (length != null) entry.length = { value: units.convertLength(length, unitSystem), unit };
+  if (width != null) entry.width = { value: units.convertLength(width, unitSystem), unit };
+  if (height != null) entry.height = { value: units.convertLength(height, unitSystem), unit };
   return [entry];
 }
-function envelopeWeight(weight, { marketplaceId }) {
+// Source weight is pounds; convert to the marketplace unit system.
+function envelopeWeight(weight, { marketplaceId, units: unitSystem }) {
   if (!weight) return null;
   const value = pickNumber(weight.value);
   if (value == null) return null;
-  return [{ value, unit: 'pounds', marketplace_id: marketplaceId }];
+  return [{ value: units.convertWeight(value, unitSystem), unit: units.weightUnit(unitSystem), marketplace_id: marketplaceId }];
 }
 
 // ── Schema-aware attribute name picking + envelope trimming ─────────────────
@@ -194,7 +198,7 @@ function buildAttributes(snapshot, { marketplaceCode, schemaPayload = null, fiel
   const languageTag = languageTagFor(marketplaceCode);
   const currency = (snapshot.pricing && snapshot.pricing.currency) || mp.currency || null;
   const ctxText = { marketplaceId, languageTag };
-  const ctx = { marketplaceId };
+  const ctx = { marketplaceId, units: mp.units || 'metric' };
 
   const want = Array.isArray(fieldNames) ? new Set(fieldNames) : null;
   const wants = (f) => !want || want.has(f);

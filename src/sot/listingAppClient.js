@@ -10,8 +10,10 @@ const RETRY_BACKOFF_MS = [500, 1500, 4000];
 const PAGE_SIZE = 5000;
 const IDS_BATCH_SIZE = 500;
 const ASIN_CACHE_TTL_MS = 5 * 60 * 1000;
+const PRODUCTS_CACHE_TTL_MS = 5 * 60 * 1000;
 const ASIN_TOKEN_RE = /^[A-Z0-9]{10}$/;
 let knownAsinsCache = null;
+let productsIndexCache = null;
 
 function isConfigured() {
   return !!(env.LISTINGAPP_API_BASE_URL && env.LISTINGAPP_SERVICE_TOKEN);
@@ -206,6 +208,51 @@ function clearKnownAsinsCache() {
   knownAsinsCache = null;
 }
 
+// Build (and cache) an index of every product row keyed by both product_id and
+// item_number, so a single failed-submission review can resolve its product
+// row with one cached full-products fetch (same pattern/TTL as getKnownAsins).
+async function getProductsIndex({ refresh = false } = {}) {
+  const now = Date.now();
+  if (!refresh && productsIndexCache && productsIndexCache.expiresAt > now) return productsIndexCache.index;
+  const rows = await getProducts();
+  const index = new Map();
+  for (const row of rows || []) {
+    if (!row || typeof row !== 'object') continue;
+    for (const key of ['product_id', 'productId', 'id']) {
+      if (row[key] != null && String(row[key]).trim() !== '') index.set(`pid:${String(row[key]).trim()}`, row);
+    }
+    for (const key of ['item_number', 'itemNumber', 'product_number']) {
+      if (row[key] != null && String(row[key]).trim() !== '') {
+        const k = `item:${String(row[key]).trim().toUpperCase()}`;
+        if (!index.has(k)) index.set(k, row);
+      }
+    }
+  }
+  productsIndexCache = { index, expiresAt: now + PRODUCTS_CACHE_TTL_MS };
+  return index;
+}
+
+// Resolve a single product row by product id (preferred) or item number.
+// Returns the matching row or null. Best-effort: callers treat a throw/null as
+// "no product context available".
+async function getProductRecord({ productId, itemNumber, refresh = false } = {}) {
+  if (productId == null && (itemNumber == null || String(itemNumber).trim() === '')) return null;
+  const index = await getProductsIndex({ refresh });
+  if (productId != null && String(productId).trim() !== '') {
+    const byId = index.get(`pid:${String(productId).trim()}`);
+    if (byId) return byId;
+  }
+  if (itemNumber != null && String(itemNumber).trim() !== '') {
+    const byItem = index.get(`item:${String(itemNumber).trim().toUpperCase()}`);
+    if (byItem) return byItem;
+  }
+  return null;
+}
+
+function clearProductsIndexCache() {
+  productsIndexCache = null;
+}
+
 async function checkHealth() {
   if (!isConfigured()) return { ok: false, configured: false, reason: unavailableReason() };
   try {
@@ -265,9 +312,12 @@ module.exports = {
   getSeasonPricing,
   getProducts,
   getKnownAsins,
+  getProductsIndex,
+  getProductRecord,
   normalizeAsin,
   collectAsinsFromRows,
   clearKnownAsinsCache,
+  clearProductsIndexCache,
   verifyCredentials,
   getUser
 };

@@ -14,6 +14,7 @@ const { adminAuth, serviceTokens, signAdminJwt, verifyCredentials, TOKEN_TTL_SEC
 const { writeGate } = require('../middleware/writeGate');
 const submissions = require('../src/submissions');
 const errorReport = require('../src/errorReport');
+const errorTranslation = require('../src/errorTranslation');
 const changeDetails = require('../src/changeDetails');
 const jobs = require('../src/jobs');
 const reconciliation = require('../src/reconciliation');
@@ -429,16 +430,19 @@ router.get('/admin/jobs/export', adminAuth, (req, res) => {
 // Every submission carrying an Amazon error/diagnostic, distilled for the
 // Errors tab. Each record exposes the full issue list (code/message/severity/
 // attributeNames) plus the raw envelope for the expandable detail panel.
-router.get('/admin/errors', adminAuth, (req, res) => {
-  const records = errorReport.listErrorSubmissions({ limit: req.query.limit || 1000 }).map(errorReport.toRecord);
-  // Attach any existing AI-resolution state so the Errors tab can render a
-  // per-row badge ("AI: proposed / applied / rejected") in a single query.
-  const resState = aiResolutions.statusMap(records.map((r) => r.submission_uuid));
-  for (const r of records) {
-    const rs = resState[r.submission_uuid];
-    r.aiResolution = rs ? { status: rs.status, confidence: rs.confidence, resolvable: rs.resolvable, appliedSubmissionUuid: rs.appliedSubmissionUuid } : null;
-  }
-  res.json({ count: records.length, errors: records, resolverEnabled: aiResolver.isEnabled() });
+router.get('/admin/errors', adminAuth, async (req, res, next) => {
+  try {
+    const records = errorReport.listErrorSubmissions({ limit: req.query.limit || 1000 }).map(errorReport.toRecord);
+    await errorTranslation.enrichRecords(records);
+    // Attach any existing AI-resolution state so the Errors tab can render a
+    // per-row badge ("AI: proposed / applied / rejected") in a single query.
+    const resState = aiResolutions.statusMap(records.map((r) => r.submission_uuid));
+    for (const r of records) {
+      const rs = resState[r.submission_uuid];
+      r.aiResolution = rs ? { status: rs.status, confidence: rs.confidence, resolvable: rs.resolvable, appliedSubmissionUuid: rs.appliedSubmissionUuid } : null;
+    }
+    res.json({ count: records.length, errors: records, resolverEnabled: aiResolver.isEnabled() });
+  } catch (err) { next(err); }
 });
 
 // Excel (.xlsx) export of all error submissions — one row per Amazon issue so

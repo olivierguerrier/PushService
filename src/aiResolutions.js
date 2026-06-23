@@ -20,6 +20,7 @@ function upsert(submissionUuid, record = {}) {
     operation: record.operation || null,
     proposed_package_json: jsonOrNull(record.proposed_package),
     changed_attr_names_json: jsonOrNull(record.changed_attr_names),
+    value_sources_json: jsonOrNull(record.value_sources),
     unresolved_json: jsonOrNull(record.unresolved),
     warnings_json: jsonOrNull(record.warnings),
     validation_json: jsonOrNull(record.validation),
@@ -32,13 +33,13 @@ function upsert(submissionUuid, record = {}) {
   db.prepare(`
     INSERT INTO ai_resolutions (
       submission_uuid, status, diagnosis, root_cause, confidence, resolvable,
-      operation, proposed_package_json, changed_attr_names_json, unresolved_json,
-      warnings_json, validation_json, model, input_hash, error_message,
+      operation, proposed_package_json, changed_attr_names_json, value_sources_json,
+      unresolved_json, warnings_json, validation_json, model, input_hash, error_message,
       applied_submission_uuid, reviewed_by, updated_at
     ) VALUES (
       @submission_uuid, @status, @diagnosis, @root_cause, @confidence, @resolvable,
-      @operation, @proposed_package_json, @changed_attr_names_json, @unresolved_json,
-      @warnings_json, @validation_json, @model, @input_hash, @error_message,
+      @operation, @proposed_package_json, @changed_attr_names_json, @value_sources_json,
+      @unresolved_json, @warnings_json, @validation_json, @model, @input_hash, @error_message,
       @applied_submission_uuid, @reviewed_by, datetime('now')
     )
     ON CONFLICT (submission_uuid) DO UPDATE SET
@@ -50,6 +51,7 @@ function upsert(submissionUuid, record = {}) {
       operation = excluded.operation,
       proposed_package_json = excluded.proposed_package_json,
       changed_attr_names_json = excluded.changed_attr_names_json,
+      value_sources_json = excluded.value_sources_json,
       unresolved_json = excluded.unresolved_json,
       warnings_json = excluded.warnings_json,
       validation_json = excluded.validation_json,
@@ -119,6 +121,7 @@ function toRecord(row) {
     operation: row.operation || null,
     proposedPackage: parseJson(row.proposed_package_json),
     changedAttrNames: parseJson(row.changed_attr_names_json) || [],
+    valueSources: parseJson(row.value_sources_json) || null,
     unresolved: parseJson(row.unresolved_json) || [],
     warnings: parseJson(row.warnings_json) || [],
     validation: parseJson(row.validation_json) || null,

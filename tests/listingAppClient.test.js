@@ -50,3 +50,40 @@ test('getKnownAsins fetches ListingApp products and caches the ASIN set', async 
     listingAppClient.clearKnownAsinsCache();
   }
 });
+
+test('getProductRecord resolves a product by product_id or item_number from one cached fetch', async () => {
+  listingAppClient.clearProductsIndexCache();
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      json: async () => ({
+        rows: [
+          { product_id: 4242, item_number: 'BT1234', brand: 'Battat' },
+          { product_id: 9999, item_number: 'BT9999', brand: 'B. toys' }
+        ],
+        truncated: false
+      })
+    };
+  };
+
+  try {
+    const byId = await listingAppClient.getProductRecord({ productId: 4242 });
+    const byItem = await listingAppClient.getProductRecord({ itemNumber: 'bt9999' });
+    const miss = await listingAppClient.getProductRecord({ productId: 1 });
+
+    assert.equal(calls, 1, 'index built from a single cached fetch');
+    assert.equal(byId.brand, 'Battat');
+    assert.equal(byItem.brand, 'B. toys', 'item_number lookup is case-insensitive');
+    assert.equal(miss, null);
+  } finally {
+    global.fetch = originalFetch;
+    listingAppClient.clearProductsIndexCache();
+  }
+});
+
+test('getProductRecord returns null without identifiers', async () => {
+  assert.equal(await listingAppClient.getProductRecord({}), null);
+});

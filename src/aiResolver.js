@@ -24,11 +24,18 @@ const packageValidator = require('./packageValidator');
 const listingsItems = require('./spapi/listingsItems');
 const productTypes = require('./spapi/productTypes');
 const sotClient = require('./sot/sotClient');
+const la = require('./sot/listingAppClient');
+const attributeSourceMap = require('./sot/attributeSourceMap');
+const openaiCredentials = require('./openaiCredentials');
 const { referenceForCodes } = require('./spapi/errorCodeReference');
 
 // Cap big blobs so a single review can't blow the prompt budget.
 const MAX_SCHEMA_ATTRS = 40;
 const MAX_JSON_CHARS = 24000;
+// Per-row cap for raw source-of-truth rows (PIM/pricing/product). Each row can
+// carry 150+ columns; we drop empties and cap the rest so the full context is
+// available without blowing the prompt budget.
+const MAX_ROW_CHARS = 12000;
 
 function isEnabled() {
   return !!env.OPENAI_RESOLVER_ENABLED;
@@ -59,6 +66,21 @@ function capped(value, max = MAX_JSON_CHARS) {
   try { json = JSON.stringify(value); } catch { return null; }
   if (json.length <= max) return value;
   return { __truncated: true, bytes: json.length, preview: json.slice(0, max) };
+}
+
+// Trim a raw source row (PIM/pricing/product) for the prompt: drop null/empty/
+// blank fields so the model sees only fields that actually carry a value, then
+// apply the per-row cap. Returns null when the row has no usable content.
+function compactRow(row, max = MAX_ROW_CHARS) {
+  if (!row || typeof row !== 'object') return null;
+  const out = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (v == null) continue;
+    if (typeof v === 'string' && v.trim() === '') continue;
+    out[k] = v;
+  }
+  if (!Object.keys(out).length) return null;
+  return capped(out, max);
 }
 
 // Pull the per-attribute schema definitions for just the attributes in play so
@@ -201,12 +223,15 @@ async function gatherContext(submission) {
     gatherWarnings.push('live listing not read: missing vendor_code/sku coordinates');
   }
 
-  // Product type schema (trimmed to the attributes in play).
+  // Product type schema (trimmed to the attributes in play). We keep the FULL
+  // schemaPayload too (returned in the context) so the deterministic grounding
+  // step can shape each envelope exactly to the product type.
   let trimmedSchema = null;
   let allowedAttributeNames = [];
+  let schemaPayload = null;
   if (submission.product_type && submission.marketplace_code) {
     try {
-      const schemaPayload = await productTypes.getSchema({
+      schemaPayload = await productTypes.getSchema({
         productType: submission.product_type,
         marketplaceCode: submission.marketplace_code
       });
@@ -224,16 +249,35 @@ async function gatherContext(submission) {
   }
 
   // Fresh PIM/pricing snapshot (source of truth values the model may need).
+  // We keep BOTH the normalized snapshot AND the raw source rows: the raw PIM
+  // row carries 150+ columns (materials, age grade, gender, keywords, ...) that
+  // the narrow snapshot omits but that Amazon often requires. The model maps
+  // those raw fields onto attributes instead of inventing placeholders.
+  const productId = (flyappMeta && (flyappMeta.productId || flyappMeta.product_id)) || null;
   let snapshot = null;
+  let pimRaw = null;
+  let pricingRaw = null;
+  let contentRaw = null;
+  // Raw (uncompacted) rows kept for the deterministic grounding step, which
+  // reads exact values rather than the prompt-trimmed view.
+  let pimRowRaw = null;
+  let pricingRowRaw = null;
   if (submission.item_number || submission.asin) {
     try {
       const built = await sotClient.buildSnapshot({
         itemNumber: submission.item_number,
-        productId: (flyappMeta && (flyappMeta.productId || flyappMeta.product_id)) || null,
+        productId,
         asin: submission.asin,
         marketplaceCode: submission.marketplace_code
       });
       snapshot = built.snapshot;
+      if (built.sources) {
+        pimRowRaw = built.sources.pim || null;
+        pricingRowRaw = built.sources.pricing || null;
+        pimRaw = compactRow(built.sources.pim);
+        pricingRaw = compactRow(built.sources.pricing);
+        contentRaw = built.sources.content || null;
+      }
       if (built.warnings && built.warnings.length) gatherWarnings.push(...built.warnings.map((w) => `snapshot: ${w}`));
     } catch (err) {
       gatherWarnings.push(`source snapshot unavailable: ${err.message}`);
@@ -241,6 +285,34 @@ async function gatherContext(submission) {
   } else {
     gatherWarnings.push('source snapshot not built: missing item_number/asin');
   }
+
+  // Full product row (one row per product) from ListingApp — adds brand /
+  // identity / lifecycle context beyond the PIM item row.
+  let productRaw = null;
+  let productRowRaw = null;
+  if (productId != null || submission.item_number) {
+    try {
+      const prod = await la.getProductRecord({ productId, itemNumber: submission.item_number });
+      productRowRaw = prod || null;
+      productRaw = compactRow(prod);
+      if (!prod) gatherWarnings.push('no product row matched product_id/item_number');
+    } catch (err) {
+      gatherWarnings.push(`product row unavailable: ${err.message}`);
+    }
+  } else {
+    gatherWarnings.push('product row not read: missing product_id/item_number');
+  }
+
+  // Namespaced source bag used by the deterministic grounding step
+  // (attributeSourceMap.buildGroundedPackage).
+  const sources = {
+    pim: pimRowRaw,
+    pricing: pricingRowRaw,
+    product: productRowRaw,
+    content: contentRaw,
+    snapshot,
+    live: liveAttributes
+  };
 
   const promptPayload = {
     submission: {
@@ -264,6 +336,18 @@ async function gatherContext(submission) {
     product_type_schema: capped(trimmedSchema),
     allowed_attribute_names: allowedAttributeNames,
     source_snapshot: capped(snapshot),
+    // Full Battat source-of-truth context. source_snapshot is the convenient
+    // normalized view (a small mapped subset); source_of_truth carries the raw
+    // rows so the model can ground EVERY required value in a real field instead
+    // of inventing placeholders. snapshot is the normalized subset, *_raw are
+    // the unmapped rows straight from ListingApp.
+    source_of_truth: {
+      snapshot: capped(snapshot),
+      pim_raw: pimRaw,
+      pricing_raw: pricingRaw,
+      product_raw: productRaw,
+      content: capped(contentRaw)
+    },
     flyapp_meta: capped(flyappMeta),
     // Cumulative resolution context. is_resolution_chain=true means earlier
     // fixes were attempted (and rejected atomically) — resolution_chain lists
@@ -275,13 +359,15 @@ async function gatherContext(submission) {
     gather_warnings: gatherWarnings
   };
 
-  return { details, codes, requestBody, history, gatherWarnings, promptPayload };
+  return { details, codes, requestBody, history, gatherWarnings, promptPayload, sources, schemaPayload };
 }
 
 function systemPrompt() {
   return [
     'You are a senior Amazon Selling Partner API (SP-API) listings specialist for Battat, an established toy manufacturer.',
-    'A push submission to Amazon FAILED. Your job is to (1) diagnose the root cause from the Amazon issues, and (2) draft a CORRECTED SP-API package that resolves the error, for a human operator to review and approve. You never push to Amazon yourself.',
+    'A push submission to Amazon FAILED. Your job is to (1) diagnose the root cause from the Amazon issues, and (2) decide WHICH attributes must be set/corrected to resolve the error. You never push to Amazon yourself.',
+    '',
+    'IMPORTANT — HOW VALUES ARE FILLED: You do NOT supply attribute VALUES. The service fills every value DETERMINISTICALLY from Battat\'s source-of-truth data using a fixed field mapping, and OMITS any attribute it cannot source. Your job is to identify the attribute NAMES the error requires (in changed_attr_names) and to diagnose the cause. Do NOT invent or guess values — any value you put in proposed_package is ignored and replaced by the mapped source value (or dropped if none exists). This is the guardrail that stops fabricated values like a made-up manufacturer, material, dimensions, or price from ever reaching the package.',
     '',
     'Inputs you are given (in the DATA payload):',
     '  - submission: the listing coordinates (asin, sku, vendor_code, marketplace, product_type) and the operation used (patchItem or submitJsonListingsFeed).',
@@ -291,16 +377,23 @@ function systemPrompt() {
     '  - live_listing_attributes: the current attribute state of the listing on Amazon (may be null).',
     '  - product_type_schema: the trimmed Product Type Definition for the attributes in play — the AUTHORITY on valid shape/enums/units/required-ness.',
     '  - allowed_attribute_names: every attribute name valid for this product type. NEVER emit an attribute not in this list.',
-    '  - source_snapshot: fresh PIM/pricing values from Battat\'s source of truth (dimensions, weights, brand, manufacturer, pricing, etc.).',
+    '  - source_snapshot: a small NORMALIZED subset of Battat\'s source of truth (dimensions, weights, brand, manufacturer, pricing, etc.) — convenient but incomplete.',
+    '  - source_of_truth: the FULL Battat product context from ListingApp. This is your authoritative data. It contains:',
+    '      • snapshot   — same normalized subset as source_snapshot.',
+    '      • pim_raw     — the complete raw PIM row (item_numbers) with 150+ columns: materials, age grade/range, gender, item type, container/pack quantities, safety warnings, dimensions, weights, country of origin, identifiers, and more. Field names are snake_case Battat columns (e.g. material_composition, age_grade_min_months, target_gender, item_type, legal_name, series).',
+    '      • pricing_raw — the raw seasonal pricing row (retail_price, sell_price, season, currency, ...).',
+    '      • product_raw — the raw product row (brand, identity, lifecycle, customer cross-references, ...).',
+    '      • content     — listing copy (title/description/bullets) when a content source is configured.',
+    '    Empty/null fields are stripped, so any field PRESENT carries a real value. These rows are the ONLY legitimate source for required-but-missing values.',
     '  - is_resolution_chain / resolution_chain / cumulative_changed_attributes: present when this failure is itself the result of an earlier AI fix. resolution_chain lists every prior attempt (oldest first) with the error it hit, the package that was tried, and the diagnosis.',
     '',
     'Rules:',
-    '  1. Build the corrected package using the SAME operation as the submission unless the error clearly requires switching.',
-    '  2. For patchItem, output JSON-Patch operations targeting /attributes/<name>. For submitJsonListingsFeed, output messages[] each with { sku, attributes }.',
-    '  3. Emit ONLY attributes valid for the product type (present in allowed_attribute_names) and shaped EXACTLY as product_type_schema requires (arrays of objects with value + marketplace_id + units where applicable).',
-    '  4. For "required but missing" errors, fill the value from source_snapshot. If the needed value is genuinely absent from every input, DO NOT invent it — list it in `unresolved` with the field name and why.',
-    '  5. For transient codes (e.g. 4000000) or "already listed" no-ops, set resolvable=false and explain; do not fabricate attribute changes.',
-    '  6. In `changed_attr_names`, list the attribute names your package modifies. In `diagnosis`/`root_cause`, cite the specific issue code(s) you are addressing.',
+    '  1. Use the SAME operation as the submission unless the error clearly requires switching (set the operation field accordingly).',
+    '  2. In `changed_attr_names`, list EVERY attribute name the error requires to be set/corrected. Use ONLY names present in allowed_attribute_names. This list is what the service acts on — be complete but do not pad it with attributes the error does not require.',
+    '  3. NEVER invent, guess, or use placeholder/dummy values anywhere (no "N/A", no "Unknown", no fabricated enums, no made-up weights/dimensions/prices/manufacturer/material). Even if you populate proposed_package, those values are discarded — the service re-derives each value from the mapped Battat source field. So focus your effort on naming the right attributes, not on guessing values.',
+    '  4. The service will OMIT any attribute it cannot ground in real source data and report it under `unresolved` for a human to complete. That is the correct, safe outcome — a smaller, fully-grounded package is always preferred over one padded with invented values.',
+    '  5. For transient codes (e.g. 4000000) or "already listed" no-ops, set resolvable=false and explain; do not request attribute changes.',
+    '  6. In `diagnosis`/`root_cause`, cite the specific issue code(s) you are addressing. You MAY still populate proposed_package and value_sources as hints, but understand the service treats them as advisory only.',
     '',
     'CUMULATIVE RESOLUTION (resolution chains) — CRITICAL:',
     '  - Amazon rejects each submission ATOMICALLY: when a package fails, NONE of its attribute changes persist on the listing. So a fix that resolved an earlier error did NOT actually stick if that same submission then failed on a different error.',
@@ -318,6 +411,7 @@ function systemPrompt() {
     '    "operation": "patchItem" | "submitJsonListingsFeed",',
     '    "proposed_package": { "patches": [ { "op": "add|replace|delete", "path": "/attributes/<name>", "value": <any> } ] }  // OR { "messages": [ { "sku": string, "attributes": { ... } } ] }',
     '    "changed_attr_names": string[],',
+    '    "value_sources": { "<attribute_name>": "<source field/path the value was read from>" },',
     '    "unresolved": [ { "field": string, "reason": string } ],',
     '    "warnings": string[]',
     '  }',
@@ -326,8 +420,10 @@ function systemPrompt() {
 }
 
 async function callModel({ systemMsg, userPayload, model }) {
+  const apiKey = await openaiCredentials.getApiKey();
+  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
   const OpenAI = loadOpenAI();
-  const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+  const openai = new OpenAI({ apiKey });
   const userText = `${systemMsg}\n\nDATA:\n${JSON.stringify(userPayload)}`;
 
   let lastErr;
@@ -527,13 +623,32 @@ async function reviewSubmission(submissionUuid, { force = false, reviewedBy = nu
   const operation = (output.operation === 'submitJsonListingsFeed' || output.operation === 'patchItem')
     ? output.operation
     : submission.operation;
-  let proposedPackage = normalizePackage(output, operation);
+
+  // DETERMINISTIC GROUNDING. The model is trusted only to DIAGNOSE and to name
+  // which attributes the error requires — never to supply their VALUES (left to
+  // itself it invents placeholders like "Battat Inc." / "Plastic" / 1x1x1). We
+  // take the union of the attributes Amazon's issues blame and the attributes
+  // the model proposed, then fill each value DETERMINISTICALLY from Battat's
+  // source-of-truth data via the fixed attributeSourceMap. Any attribute with
+  // no mapped source value is OMITTED and reported as unresolved — nothing is
+  // fabricated.
+  const targetAttrNames = attributeSourceMap.collectTargetAttrNames({ details: context.details, output });
+  const grounded = attributeSourceMap.buildGroundedPackage({
+    attrNames: targetAttrNames,
+    operation,
+    sources: context.sources,
+    marketplaceCode: submission.marketplace_code,
+    schemaPayload: context.schemaPayload,
+    sku: submission.effective_sku || submission.sku
+  });
+  let proposedPackage = grounded.package;
+  const groundingNote = `values filled deterministically from Battat source data via field mapping — ${grounded.resolved.length} attribute(s) grounded, ${grounded.unresolved.length} omitted (no source value)`;
 
   // Make the package CUMULATIVE across the resolution chain. Amazon rejects
   // every failed submission atomically, so each prior AI fix's changes never
   // persisted — re-pushing only the latest error's fix re-triggers the earlier
   // error. We deterministically union the packages of every prior AI-fix attempt
-  // in the chain (oldest first) under the model's new proposal, so all
+  // in the chain (oldest first) under the new grounded proposal, so all
   // corrections accumulate instead of oscillating.
   let cumulativeNote = null;
   if (proposedPackage) {
@@ -564,8 +679,26 @@ async function reviewSubmission(submissionUuid, { force = false, reviewedBy = nu
     ...(context.gatherWarnings || []),
     ...(Array.isArray(output.warnings) ? output.warnings : []),
     ...((validation && validation.warnings) || []),
+    groundingNote,
     ...(cumulativeNote ? [cumulativeNote] : [])
   ];
+
+  // Provenance is now CODE-generated: attribute -> the exact source field the
+  // value was pulled from. Truthful by construction (the model no longer
+  // supplies values), so a reviewer can audit every value back to real data.
+  const valueSources = Object.keys(grounded.valueSources || {}).length ? grounded.valueSources : null;
+
+  // Unresolved = attributes the fix needed but could not be grounded from any
+  // source field. Merge the deterministic omissions with anything the model
+  // flagged, deduped by field name (the grounded reason wins).
+  const unresolvedByField = new Map();
+  for (const u of (Array.isArray(output.unresolved) ? output.unresolved : [])) {
+    if (u && u.field) unresolvedByField.set(String(u.field), { field: String(u.field), reason: u.reason || null });
+  }
+  for (const u of (grounded.unresolved || [])) {
+    if (u && u.field) unresolvedByField.set(String(u.field), u);
+  }
+  const unresolved = [...unresolvedByField.values()];
 
   const rec = aiResolutions.upsert(submissionUuid, {
     status: 'PROPOSED',
@@ -579,8 +712,9 @@ async function reviewSubmission(submissionUuid, { force = false, reviewedBy = nu
     // it reflects the cumulative merge) over the model's self-reported list.
     changed_attr_names: (validation && validation.changedAttrNames && validation.changedAttrNames.length)
       ? validation.changedAttrNames
-      : (Array.isArray(output.changed_attr_names) ? output.changed_attr_names : []),
-    unresolved: Array.isArray(output.unresolved) ? output.unresolved : [],
+      : grounded.resolved,
+    value_sources: valueSources,
+    unresolved,
     warnings,
     validation,
     model,

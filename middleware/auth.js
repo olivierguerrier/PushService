@@ -57,7 +57,18 @@ async function findActiveUserByIdCached(id) {
   const now = Date.now();
   const hit = userCache.get(id);
   if (hit && hit.expiresAt > now) return hit.row;
-  const row = await listingAppClient.getUser(id);
+  let row;
+  try {
+    row = await listingAppClient.getUser(id);
+  } catch (err) {
+    // ListingApp bridge unreachable. Rather than fail the re-check, serve the
+    // last-known-good row (even though its 30s freshness window lapsed) so a
+    // transient outage doesn't 503 every authenticated request. Re-throw only
+    // when we have never seen this user — the caller then decides whether to
+    // grace-trust the signed JWT.
+    if (hit) return hit.row;
+    throw err;
+  }
   userCache.set(id, { row, expiresAt: now + USER_CACHE_TTL_MS });
   if (userCache.size > 500) {
     const firstKey = userCache.keys().next().value;
@@ -120,8 +131,15 @@ async function adminAuth(req, res, next) {
       try {
         current = await findActiveUserByIdCached(payload.id);
       } catch (dbErr) {
-        console.warn('[AUTH] user lookup failed:', dbErr.message);
-        return res.status(503).json({ error: 'auth_lookup_failed' });
+        // ListingApp is unreachable and we have no cached row to consult. The
+        // JWT itself is already verified and still within its TTL, so grace-
+        // trust it instead of 503-ing every request during an LA outage —
+        // otherwise a brief bridge blip locks every operator out of a console
+        // they're legitimately signed into. Exposure stays bounded by the JWT
+        // expiry, and a real deactivate is enforced the moment LA recovers.
+        console.warn('[AUTH] user lookup failed, grace-trusting valid JWT until expiry:', dbErr.message);
+        req.admin = payload;
+        return next();
       }
       if (!current || !current.is_active) {
         return res.status(401).json({ error: 'user_disabled' });

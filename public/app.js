@@ -20,11 +20,71 @@
   function headers() {
     return token ? { Authorization: `Bearer ${token}` } : {};
   }
+
+  // Human-readable copy for the error codes the API returns, so callers can
+  // surface "Select at least one item" instead of a raw `no_submissions`.
+  const FRIENDLY_ERRORS = {
+    no_submissions: 'Select at least one submission first.',
+    no_jobs: 'Select at least one job first.',
+    no_package: 'No proposed package to apply — run a review first.',
+    writes_disabled: 'Live writes to Amazon are turned off (kill switch).',
+    package_invalid: 'The proposed package failed validation.',
+    auth_lookup_failed: 'Temporarily can’t reach ListingApp — reconnecting…',
+    auth_unavailable: 'ListingApp authentication is unreachable — try again shortly.',
+    too_many_login_attempts: 'Too many attempts — wait a few minutes.'
+  };
+  function friendly(code) { return FRIENDLY_ERRORS[code] || code; }
+
+  // A single, unobtrusive banner for transient backend trouble (ListingApp
+  // bridge blips → 503, or a dropped network). We do NOT boot the operator to
+  // login for these — the session is still valid; only the backend is briefly
+  // unavailable. It auto-clears on the next successful request.
+  let _bannerEl = null;
+  function connectionBanner(message) {
+    if (!_bannerEl) {
+      _bannerEl = document.createElement('div');
+      _bannerEl.id = 'connectionBanner';
+      _bannerEl.setAttribute('role', 'status');
+      _bannerEl.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;'
+        + 'padding:8px 16px;text-align:center;font-size:13px;font-weight:600;'
+        + 'color:#fff;background:#b45309;box-shadow:0 1px 4px rgba(0,0,0,.2);';
+      document.body.appendChild(_bannerEl);
+    }
+    _bannerEl.textContent = message;
+    _bannerEl.style.display = 'block';
+  }
+  function clearConnectionBanner() {
+    if (_bannerEl) _bannerEl.style.display = 'none';
+  }
+
+  // Decode the server's error code from a non-OK response without throwing.
+  async function errorCode(res) {
+    try { const j = await res.json(); return j.error || j.status || String(res.status); }
+    catch (_) { return String(res.status); }
+  }
+
+  // True for transient auth/backend failures we should ride out (banner +
+  // retry on next poll) rather than treating as a hard error or a logout.
+  function isTransientAuth(code) {
+    return code === 'auth_lookup_failed' || code === 'auth_unavailable';
+  }
+
   async function api(path) {
-    const res = await fetch(path, { headers: headers(), credentials: 'same-origin' });
+    let res;
+    try {
+      res = await fetch(path, { headers: headers(), credentials: 'same-origin' });
+    } catch (_) {
+      connectionBanner('Network error — reconnecting…');
+      throw new Error('503');
+    }
     if (res.status === 401) { redirectToLogin(); throw new Error('401'); }
-    if (!res.ok) throw new Error(`${res.status}`);
-    return res.json();
+    if (res.ok) { clearConnectionBanner(); return res.json(); }
+    const code = await errorCode(res);
+    if (res.status === 503 && isTransientAuth(code)) {
+      connectionBanner('Reconnecting to ListingApp…');
+      throw new Error('503');
+    }
+    throw new Error(friendly(code));
   }
   async function apiPost(path, body) {
     const opts = { method: 'POST', headers: headers(), credentials: 'same-origin' };
@@ -32,14 +92,21 @@
       opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers);
       opts.body = JSON.stringify(body);
     }
-    const res = await fetch(path, opts);
-    if (res.status === 401) { redirectToLogin(); throw new Error('401'); }
-    if (!res.ok) {
-      let detail = String(res.status);
-      try { const j = await res.json(); detail = j.error || j.status || detail; } catch (_) {}
-      throw new Error(detail);
+    let res;
+    try {
+      res = await fetch(path, opts);
+    } catch (_) {
+      connectionBanner('Network error — reconnecting…');
+      throw new Error('503');
     }
-    return res.json();
+    if (res.status === 401) { redirectToLogin(); throw new Error('401'); }
+    if (res.ok) { clearConnectionBanner(); return res.json(); }
+    const code = await errorCode(res);
+    if (res.status === 503 && isTransientAuth(code)) {
+      connectionBanner('Reconnecting to ListingApp…');
+      throw new Error('503');
+    }
+    throw new Error(friendly(code));
   }
   function statusBadge(s) {
     const ok = ['APPLIED', 'completed'];
@@ -2010,7 +2077,12 @@
   }
 
   const emptyRow = (n) => `<tr><td colspan="${n}" style="text-align:center;color:var(--text-muted);padding:20px;">No rows.</td></tr>`;
-  const errRow = (n, e) => `<tr><td colspan="${n}" style="text-align:center;color:var(--color-neg-text);padding:20px;">${e.message === '401' ? 'Unauthorized' : esc(e.message)}</td></tr>`;
+  const errRow = (n, e) => {
+    const msg = e.message === '401' ? 'Unauthorized'
+      : e.message === '503' ? 'Reconnecting to ListingApp…'
+      : esc(e.message);
+    return `<tr><td colspan="${n}" style="text-align:center;color:var(--color-neg-text);padding:20px;">${msg}</td></tr>`;
+  };
 
   // Distinct Amazon issue codes for one error record, in first-seen order.
   function errorCodes(rec) {
@@ -2071,6 +2143,7 @@
     { key: 'marketplace_code', label: 'Mkt', sortable: true, filterable: true },
     { key: 'codes', label: 'Codes', sortable: true, filterable: true },
     { key: 'message', label: 'Message', sortable: true, filterable: true },
+    { key: 'message_en', label: 'English', sortable: true, filterable: true },
     { key: 'details', label: 'Details', fixed: true, sortable: false, filterable: false },
     { key: 'retry', label: 'Retry', fixed: true, sortable: false, filterable: false },
     { key: 'aifix', label: 'AI fix', fixed: true, sortable: false, filterable: false },
@@ -2160,6 +2233,11 @@
         const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
         return r.error_message || (details[0] ? formatErrorDetail(details[0]) : '');
       }
+      case 'message_en': {
+        if (r.error_message_en) return r.error_message_en;
+        const detailsEn = Array.isArray(r.errorDetailsEn) ? r.errorDetailsEn : [];
+        return detailsEn[0] || errorFilterValue(r, 'message');
+      }
       default: return r[key] == null ? '' : String(r[key]);
     }
   }
@@ -2228,6 +2306,14 @@
         const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
         const msg = r.error_message || (details[0] ? formatErrorDetail(details[0]) : '');
         return `<td>${esc(msg)}</td>`;
+      }
+      case 'message_en': {
+        const english = errorFilterValue(r, 'message_en');
+        const original = errorFilterValue(r, 'message');
+        const same = english === original;
+        const cls = same ? ' class="muted-cell"' : '';
+        const title = same ? ' title="Already in English"' : '';
+        return `<td${cls}${title}>${esc(english)}</td>`;
       }
       case 'details': {
         const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
@@ -2620,6 +2706,9 @@
     const changed = (r.changedAttrNames && r.changedAttrNames.length)
       ? `<div class="ai-section"><h4>Attributes changed</h4><p>${r.changedAttrNames.map((n) => `<code>${esc(n)}</code>`).join(' ')}</p></div>`
       : '';
+    const valueSources = (r.valueSources && typeof r.valueSources === 'object' && Object.keys(r.valueSources).length)
+      ? `<div class="ai-section"><h4>Value sources (where each value came from)</h4><ul>${Object.entries(r.valueSources).map(([attr, src]) => `<li><code>${esc(attr)}</code> &larr; ${esc(String(src))}</li>`).join('')}</ul></div>`
+      : '';
     const unresolved = listBlock('Unresolved (needs data the model could not source)', r.unresolved, 'warn');
     const warnings = listBlock('Warnings', r.warnings, 'warn');
     const valBlock = validationProblems.length ? listBlock('Validation problems (must be fixed before push)', validationProblems, 'bad') : '';
@@ -2631,7 +2720,7 @@
         ${editorNote}
         <textarea id="aiPackageEditor" class="ai-editor" spellcheck="false" ${applied ? 'readonly' : ''}>${esc(pkgJson)}</textarea>
       </div>`;
-    if (aiBody) aiBody.innerHTML = head + diag + root + changed + unresolved + warnings + valBlock + editor;
+    if (aiBody) aiBody.innerHTML = head + diag + root + changed + valueSources + unresolved + warnings + valBlock + editor;
 
     // Button states.
     if (aiApplyBtn) {
