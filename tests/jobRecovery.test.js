@@ -12,7 +12,7 @@ const forwarder = require('../src/forwarder');
 
 const newId = () => crypto.randomUUID();
 
-test('resumeInterruptedForwards re-enqueues IN_PROGRESS rows without a feed_id', async () => {
+test('resumeInterruptedForwards re-enqueues queued rows without a feed_id', async () => {
   const realForward = forwarder.forward;
   const forwarded = [];
   forwarder.forward = async (submission) => {
@@ -33,7 +33,7 @@ test('resumeInterruptedForwards re-enqueues IN_PROGRESS rows without a feed_id',
       caller: 'test',
       scope: 'content',
       operation: 'patchItem',
-      status: 'IN_PROGRESS',
+      status: 'QUEUED',
       requestBody: { patches: [] }
     });
 

@@ -1,7 +1,7 @@
 // Boot-time recovery: resume submissions interrupted by a process stop and
 // refresh parent job rollups. The approval queue is in-memory, so any
-// IN_PROGRESS row that never received a feed_id (patch mid-forward, or feed
-// submit not yet persisted) must be re-enqueued on startup.
+// QUEUED row or IN_PROGRESS row that never received a feed_id (patch mid-forward,
+// or feed submit not yet persisted) must be re-enqueued on startup.
 const { getDb } = require('./db');
 const submissions = require('./submissions');
 const approvalQueue = require('./approvalQueue');
@@ -13,7 +13,7 @@ const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
 function listInterruptedForwards() {
   return getDb().prepare(`
     SELECT * FROM push_submissions
-    WHERE status = 'IN_PROGRESS' AND feed_id IS NULL
+    WHERE status IN ('QUEUED', 'IN_PROGRESS') AND feed_id IS NULL
     ORDER BY id ASC
   `).all();
 }

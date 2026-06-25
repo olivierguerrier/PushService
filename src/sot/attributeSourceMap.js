@@ -408,6 +408,24 @@ function resolveGroundedValue(attrName, { sources, ctx, schemaPayload }) {
   return { envelope, source };
 }
 
+// Repurposed value for `attrName` from another accepted record of the same ASIN
+// (a sibling submission or Amazon's catalogue), assembled upstream in
+// aiResolver.gatherContext via siblingAttributeSource. Returns { envelope, source }
+// with provenance, or null. Only consulted after PIM grounding yields nothing.
+function siblingValueFor(sources, attrName, schemaPayload) {
+  const sib = sources && sources.siblings;
+  if (!sib || !sib.candidates) return null;
+  let envelope = sib.candidates[attrName];
+  if (envelope == null) return null;
+  if (schemaPayload) {
+    const trimmed = translator.trimEnvelopeToSchema(envelope, schemaPayload, attrName);
+    if (trimmed && (!Array.isArray(trimmed) || trimmed.length)) envelope = trimmed;
+  }
+  if (!envelope || (Array.isArray(envelope) && !envelope.length)) return null;
+  const source = (sib.provenance && sib.provenance[attrName]) || 'sibling-asin-record';
+  return { envelope, source };
+}
+
 function unique(list) {
   return [...new Set((list || []).filter(Boolean).map(String))];
 }
@@ -431,13 +449,22 @@ function buildGroundedPackage({ attrNames, operation, sources, marketplaceCode, 
 
   const attrs = {};
   for (const name of names) {
-    if (!ruleFor(name)) {
-      result.unresolved.push({ field: name, reason: 'no source-field mapping defined for this attribute' });
-      continue;
-    }
-    const got = resolveGroundedValue(name, { sources, ctx, schemaPayload });
+    // PIM/source-of-truth always wins: try the deterministic field mapping first.
+    let got = ruleFor(name) ? resolveGroundedValue(name, { sources, ctx, schemaPayload }) : null;
+    // Fallback: repurpose a value from another accepted record of this ASIN
+    // (sibling submission or Amazon catalogue). Covers attributes PIM cannot
+    // ground, including ones with no source-field mapping at all.
     if (!got) {
-      result.unresolved.push({ field: name, reason: 'no value found in Battat source data' });
+      const sib = siblingValueFor(sources, name, schemaPayload);
+      if (sib) got = sib;
+    }
+    if (!got) {
+      result.unresolved.push({
+        field: name,
+        reason: ruleFor(name)
+          ? 'no value found in Battat source data or sibling ASIN records'
+          : 'no source-field mapping defined for this attribute and no sibling ASIN value'
+      });
       continue;
     }
     attrs[name] = got.envelope;

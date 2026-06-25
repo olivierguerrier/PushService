@@ -1,7 +1,7 @@
 // Dashboard throughput metrics for the operator console.
 const { getDb } = require('./db');
 
-const ACTIVE_SUB_STATUSES = ['PENDING_APPROVAL', 'IN_PROGRESS', 'SUBMITTED'];
+const ACTIVE_SUB_STATUSES = ['PENDING_APPROVAL', 'QUEUED', 'IN_PROGRESS', 'SUBMITTED'];
 const SETTLED_SUB_STATUSES = ['APPLIED', 'FAILED', 'REJECTED', 'EXPIRED', 'BLOCKED', 'SKIPPED'];
 const THROUGHPUT_WINDOW_MIN = 15;
 const DASHBOARD_WINDOW_HOURS = 24;
@@ -136,6 +136,7 @@ function submissionProgressInWindow(hours) {
       SUM(CASE WHEN s.status IN (${settledPh}) THEN 1 ELSE 0 END) AS done,
       SUM(CASE WHEN s.status IN (${activePh}) THEN 1 ELSE 0 END) AS active,
       SUM(CASE WHEN s.status = 'PENDING_APPROVAL' THEN 1 ELSE 0 END) AS pending_approval,
+      SUM(CASE WHEN s.status = 'QUEUED' THEN 1 ELSE 0 END) AS queued,
       SUM(CASE WHEN s.status IN ('IN_PROGRESS', 'SUBMITTED') THEN 1 ELSE 0 END) AS in_flight,
       SUM(CASE WHEN s.status = 'APPLIED' THEN 1 ELSE 0 END) AS ok,
       SUM(CASE WHEN s.status IN ('FAILED', 'REJECTED', 'EXPIRED', 'BLOCKED') THEN 1 ELSE 0 END) AS failed
@@ -153,6 +154,7 @@ function submissionProgressInWindow(hours) {
     remaining,
     active: Number(row.active) || 0,
     pendingApproval: Number(row.pending_approval) || 0,
+    queued: Number(row.queued) || 0,
     inFlight: Number(row.in_flight) || 0,
     ok: Number(row.ok) || 0,
     failed: Number(row.failed) || 0,
@@ -178,6 +180,7 @@ function getDashboard() {
     jobsPending: jobs24h.pending,
     submissionsActive: progress24h.active,
     submissionsPendingApproval: progress24h.pendingApproval,
+    submissionsQueued: progress24h.queued,
     submissionsInFlight: progress24h.inFlight,
     progress24h,
     progress: progress24h,
@@ -203,6 +206,7 @@ function emptyDashboard() {
     remaining: 0,
     active: 0,
     pendingApproval: 0,
+    queued: 0,
     inFlight: 0,
     ok: 0,
     failed: 0,
@@ -215,6 +219,7 @@ function emptyDashboard() {
     jobsPending: 0,
     submissionsActive: 0,
     submissionsPendingApproval: 0,
+    submissionsQueued: 0,
     submissionsInFlight: 0,
     progress24h,
     progress: progress24h,

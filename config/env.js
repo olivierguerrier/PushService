@@ -214,6 +214,26 @@ module.exports = {
     return vaultBootstrap.vault.isConfigured();
   },
 
+  // ── Sibling-ASIN attribute repurposing ─────────────────────────────────────
+  // When a push fails on required-but-missing attributes that Battat PIM cannot
+  // ground, the resolver may borrow those values from OTHER accepted records of
+  // the same ASIN (different vendor code / SKU / marketplace) and surface them —
+  // with provenance — in the proposal for operator review (never auto-applied).
+  // SIBLING_REPURPOSE_ENABLED gates the whole feature; SIBLING_REPURPOSE_USE_CATALOG
+  // additionally allows a live Amazon Catalog Items lookup as a last-resort
+  // fallback when no accepted sibling submission carries the attribute.
+  get SIBLING_REPURPOSE_ENABLED() { return bool('SIBLING_REPURPOSE_ENABLED', true); },
+  get SIBLING_REPURPOSE_USE_CATALOG() { return bool('SIBLING_REPURPOSE_USE_CATALOG', true); },
+
+  // Automatic repurpose on push failure. When a patch/feed FAILS with
+  // required-but-missing attributes, the service finds the most complete record
+  // of the SAME ASIN in the SAME marketplace under another vendor code, borrows
+  // its values for the missing attributes, and re-pushes the listing under the
+  // failing vendor code automatically. Same-marketplace sourcing keeps language
+  // and units correct. Gated by SIBLING_REPURPOSE_ENABLED and the master write
+  // switch (SPAPI_WRITES_ENABLED); set false to keep repurposing review-only.
+  get AUTO_REPURPOSE_ON_FAILURE() { return bool('AUTO_REPURPOSE_ON_FAILURE', true); },
+
   // Poller
   get POLLER_CRON() { return str('POLLER_CRON', '*/2 * * * *'); },
   get JOB_STALE_MINUTES() { return int('JOB_STALE_MINUTES', 15); },

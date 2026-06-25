@@ -26,6 +26,15 @@ test('dashboard metrics reflect 24h jobs including finished work', () => {
     status: 'IN_PROGRESS',
     requestBody: {}
   });
+  submissions.insert({
+    submissionUuid: 'sub-metrics-queued',
+    jobUuid: runningUuid,
+    caller: 'test',
+    scope: 'listing',
+    operation: 'patch',
+    status: 'QUEUED',
+    requestBody: {}
+  });
 
   const completedUuid = 'job-metrics-done';
   jobs.create({
@@ -58,11 +67,13 @@ test('dashboard metrics reflect 24h jobs including finished work', () => {
   assert.equal(m.jobs24h.total, 2);
   assert.equal(m.jobs24h.running, 1);
   assert.equal(m.jobs24h.completed, 1);
-  assert.equal(m.progress24h.total, 4);
+  assert.equal(m.progress24h.total, 5);
   assert.equal(m.progress24h.done, 3);
+  assert.equal(m.progress24h.queued, 1);
+  assert.equal(m.progress24h.inFlight, 1);
   assert.equal(m.progress24h.ok, 3);
-  assert.equal(m.progress24h.percent, 75);
-  assert.equal(m.progress24h.remaining, 1);
+  assert.equal(m.progress24h.percent, 60);
+  assert.equal(m.progress24h.remaining, 2);
   assert.ok(m.throughput.settled >= 0);
   assert.ok(m.eta.available);
 
@@ -87,7 +98,7 @@ test('dashboard metrics reflect 24h jobs including finished work', () => {
 
   const m2 = metrics.getDashboard();
   assert.equal(m2.jobs24h.total, 2);
-  assert.equal(m2.progress24h.total, 4);
+  assert.equal(m2.progress24h.total, 5);
 });
 
 test('throughput uses elapsed time since job start when under rolling window', () => {

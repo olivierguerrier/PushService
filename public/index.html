@@ -253,7 +253,7 @@
       </div>
       <div class="tablewrap"><table id="errorsTable"><thead><tr>
         <th class="select-cell"><input id="selectAllErrors" type="checkbox" aria-label="Select all visible errors" /></th>
-        <th>Created</th><th>Status</th><th>ASIN</th><th>SKU</th><th>Mkt</th>
+        <th>Created</th><th>Status</th><th>Type</th><th>ASIN</th><th>SKU</th><th>Mkt</th>
         <th>Codes</th><th>Message</th><th>Details</th><th>Retry</th><th>AI fix</th><th>Archive</th>
       </tr></thead><tbody></tbody></table></div>
       <div id="errorsPagination" class="pagination-bar hidden">
@@ -284,6 +284,25 @@
   <div class="col-selector-overlay" id="queueColSelectorOverlay"></div>
   <div class="col-selector-overlay" id="jobsColSelectorOverlay"></div>
 
+  <!-- Raw package / request JSON viewer -->
+  <div id="jsonModalOverlay" class="ai-modal-overlay" hidden>
+    <div class="ai-modal json-modal" role="dialog" aria-modal="true" aria-labelledby="jsonModalTitle">
+      <div class="ai-modal-header">
+        <div>
+          <h3 id="jsonModalTitle">JSON package</h3>
+          <div class="ai-modal-subtitle" id="jsonModalSubtitle"></div>
+        </div>
+        <button id="jsonModalClose" class="ai-modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div id="jsonModalBody" class="ai-modal-body"></div>
+      <div class="ai-modal-footer">
+        <span id="jsonModalStatus" class="bulk-status"></span>
+        <span class="ai-modal-footer-spacer"></span>
+        <button id="jsonCopyBtn" class="btn-ghost" type="button">Copy JSON</button>
+      </div>
+    </div>
+  </div>
+
   <!-- AI error-resolution review modal -->
   <div id="aiModalOverlay" class="ai-modal-overlay" hidden>
     <div class="ai-modal" role="dialog" aria-modal="true" aria-labelledby="aiModalTitle">
@@ -307,6 +326,6 @@
 
   <script src="/col-filter.js?v=20260617-1"></script>
   <script src="/column-ui.js?v=20260617-1"></script>
-  <script src="/app.js?v=20260623-4"></script>
+  <script src="/app.js?v=20260623-5"></script>
 </body>
 </html>

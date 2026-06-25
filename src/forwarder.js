@@ -1,4 +1,4 @@
-// The live SP-API forwarder. Takes a PENDING/IN_PROGRESS submission row and
+// The live SP-API forwarder. Takes a QUEUED/IN_PROGRESS submission row and
 // actually talks to Amazon, capturing the complete envelope for the audit
 // trail: prior Amazon state (GET before write, enables revert), the live
 // request, the full response, every status transition, and any error.
@@ -12,6 +12,7 @@ const feeds = require('./spapi/feeds');
 const audit = require('./audit/auditEvents');
 const reconciliation = require('./reconciliation');
 const packageValidator = require('./packageValidator');
+const autoRepurpose = require('./autoRepurpose');
 const { scrubObject } = require('../lib/safeError');
 
 const PACKAGE_LEVEL_ATTR = 'package_level';
@@ -387,7 +388,12 @@ async function forward(submission) {
   }
   try {
     if (submission.operation === 'submitJsonListingsFeed') return await forwardFeed(submission);
-    return await forwardPatch(submission);
+    const settled = await forwardPatch(submission);
+    // On a patch validation failure (required-but-missing attributes), try to
+    // auto-fill from the most complete same-marketplace sibling and re-push.
+    // Best-effort and non-recursive (see autoRepurpose.eligible).
+    if (settled && settled.status === 'FAILED') await autoRepurpose.maybeRepurpose(settled);
+    return settled;
   } catch (err) {
     // Persist a structured diagnostic blob (not just a short string) so the
     // root cause survives for later analysis: HTTP status, error code, the raw

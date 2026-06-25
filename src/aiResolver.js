@@ -26,6 +26,7 @@ const productTypes = require('./spapi/productTypes');
 const sotClient = require('./sot/sotClient');
 const la = require('./sot/listingAppClient');
 const attributeSourceMap = require('./sot/attributeSourceMap');
+const siblingAttributeSource = require('./sot/siblingAttributeSource');
 const openaiCredentials = require('./openaiCredentials');
 const { referenceForCodes } = require('./spapi/errorCodeReference');
 
@@ -303,6 +304,33 @@ async function gatherContext(submission) {
     gatherWarnings.push('product row not read: missing product_id/item_number');
   }
 
+  // Sibling-ASIN repurposing: for the attributes Amazon's issues blame, gather
+  // candidate values from OTHER accepted records of this same ASIN (different
+  // vendor code / SKU / marketplace) and, as a last resort, from Amazon's live
+  // catalogue. These fill gaps Battat PIM cannot ground, and are surfaced (with
+  // provenance) for operator review — never auto-applied.
+  const issueAttrNames = new Set();
+  for (const d of details || []) {
+    for (const a of (d.attributeNames || [])) if (a) issueAttrNames.add(String(a));
+  }
+  let siblings = { candidates: {}, provenance: {} };
+  if (issueAttrNames.size) {
+    try {
+      const sib = await siblingAttributeSource.buildSiblingCandidates({
+        attrNames: [...issueAttrNames],
+        asin: submission.asin,
+        marketplaceCode: submission.marketplace_code,
+        productType: submission.product_type,
+        excludeUuid: submission.submission_uuid,
+        schemaPayload
+      });
+      siblings = { candidates: sib.candidates, provenance: sib.provenance };
+      if (sib.warnings && sib.warnings.length) gatherWarnings.push(...sib.warnings);
+    } catch (err) {
+      gatherWarnings.push(`sibling repurpose unavailable: ${err.message}`);
+    }
+  }
+
   // Namespaced source bag used by the deterministic grounding step
   // (attributeSourceMap.buildGroundedPackage).
   const sources = {
@@ -311,7 +339,8 @@ async function gatherContext(submission) {
     product: productRowRaw,
     content: contentRaw,
     snapshot,
-    live: liveAttributes
+    live: liveAttributes,
+    siblings
   };
 
   const promptPayload = {

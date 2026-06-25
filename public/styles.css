@@ -1126,6 +1126,55 @@ tr.row-archived { opacity: 0.55; }
 }
 [data-theme="dark"] .ai-editor { background: rgba(0,0,0,0.25); }
 
+.json-modal { width: min(1040px, 100%); }
+.json-summary {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--soft-blue);
+}
+.json-summary h4,
+.json-section h4 {
+  margin: 0 0 6px;
+  font-size: var(--font-size-small);
+}
+.json-summary p,
+.json-hint {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+}
+.json-summary-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--card-background);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.json-summary-table th,
+.json-summary-table td {
+  padding: 6px 8px;
+  font-size: var(--font-size-caption);
+}
+.json-viewer {
+  max-width: none;
+  max-height: 58vh;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: rgba(0,0,0,0.03);
+  color: var(--text-secondary);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  word-break: normal;
+}
+[data-theme="dark"] .json-viewer { background: rgba(0,0,0,0.25); }
+
 /* ── Expandable submission change details ────────────────────────────────── */
 .col-caret { width: 34px; text-align: center; padding-left: 6px; padding-right: 6px; }
 button.caret {

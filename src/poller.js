@@ -11,6 +11,7 @@ const feeds = require('./spapi/feeds');
 const audit = require('./audit/auditEvents');
 const { recomputeJobStatus } = require('./jobOrchestrator');
 const { scheduleReconciliation, summarizeIssues, isPackageLevelRequiredError, splitFeedPayload } = require('./forwarder');
+const autoRepurpose = require('./autoRepurpose');
 const { scrubObject } = require('../lib/safeError');
 
 function parse(json) {
@@ -127,6 +128,9 @@ async function pollOne(submission) {
     });
     audit.record({ event: 'feed_settled', submissionUuid: submission.submission_uuid, actor: 'poller', details: { processingStatus, hadErrors, summary } });
     if (!hadErrors) scheduleReconciliation(submissions.getByUuid(submission.submission_uuid));
+    // On a feed validation failure, attempt the same-marketplace sibling
+    // repurpose + re-push (best-effort, non-recursive).
+    else await autoRepurpose.maybeRepurpose(submissions.getByUuid(submission.submission_uuid));
   } else {
     // FATAL / CANCELLED
     submissions.update(submission.submission_uuid, {

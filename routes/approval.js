@@ -2,9 +2,9 @@
 //   GET /approve/:token?decision=approve|reject[&approver=email]
 //
 // PUBLIC (no bearer) — the random 24-byte approval token IS the credential.
-// One-time, expires after APPROVAL_TTL_MIN minutes. On approve we flip the
-// submission to IN_PROGRESS and forward to Amazon in the background so the
-// reviewer's click isn't blocked by the SP-API round-trip.
+// One-time, expires after APPROVAL_TTL_MIN minutes. On approve we queue the
+// submission for Amazon in the background so the reviewer's click isn't blocked
+// by the SP-API round-trip.
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -81,10 +81,10 @@ async function handleApprovalClick(req, res) {
     return sendResultPage(res, { title: 'Submission rejected', statusClass: 'warn', statusLabel: 'REJECTED', message: 'The write was rejected and will not be sent to Amazon.', submissionUuid: rejected.submission_uuid, caller: rejected.caller, scope: rejected.scope, asin: rejected.asin, vendorCode: rejected.vendor_code, sku: rejected.sku, marketplaceCode: rejected.marketplace_code, comment: rejected.approver_comment, approvedBy: approver, approvedAt: nowIso });
   }
 
-  const approved = submissions.update(submission.submission_uuid, { status: 'IN_PROGRESS', approved_by: approver, approved_at: nowIso });
+  const approved = submissions.update(submission.submission_uuid, { status: 'QUEUED', approved_by: approver, approved_at: nowIso });
   audit.record({ event: 'approved', submissionUuid: submission.submission_uuid, actor: approver });
   approvalQueue.enqueue(approved);
-  return sendResultPage(res, { title: 'Submission approved', statusClass: 'ok', statusLabel: 'APPROVED', message: 'The write is now being forwarded to Amazon. Refresh the queue to see the outcome.', submissionUuid: approved.submission_uuid, caller: approved.caller, scope: approved.scope, asin: approved.asin, vendorCode: approved.vendor_code, sku: approved.sku, marketplaceCode: approved.marketplace_code, comment: approved.approver_comment, approvedBy: approver, approvedAt: nowIso });
+  return sendResultPage(res, { title: 'Submission approved', statusClass: 'ok', statusLabel: 'QUEUED', message: 'The write is queued for Amazon. Refresh the queue to see when it moves in flight.', submissionUuid: approved.submission_uuid, caller: approved.caller, scope: approved.scope, asin: approved.asin, vendorCode: approved.vendor_code, sku: approved.sku, marketplaceCode: approved.marketplace_code, comment: approved.approver_comment, approvedBy: approver, approvedAt: nowIso });
 }
 
 router.get('/:token', (req, res, next) => { handleApprovalClick(req, res).catch(next); });

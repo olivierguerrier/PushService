@@ -141,12 +141,91 @@
   }
   function statusBadge(s) {
     const ok = ['APPLIED', 'completed'];
-    const warn = ['PENDING_APPROVAL', 'IN_PROGRESS', 'SUBMITTED', 'running', 'partial', 'SKIPPED'];
+    const warn = ['PENDING_APPROVAL', 'QUEUED', 'IN_PROGRESS', 'SUBMITTED', 'running', 'partial', 'SKIPPED'];
     const cls = ok.includes(s) ? 'ok' : warn.includes(s) ? 'warn' : 'bad';
     return `<span class="badge ${cls}">${esc(s)}</span>`;
   }
   function esc(s) {
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  let jsonModalPayload = null;
+  const jsonOverlay = $('#jsonModalOverlay');
+  const jsonBody = $('#jsonModalBody');
+  const jsonSubtitle = $('#jsonModalSubtitle');
+  const jsonStatus = $('#jsonModalStatus');
+
+  function prettyJson(value) {
+    return JSON.stringify(value, null, 2);
+  }
+
+  function bulletSummary(payload) {
+    const locations = Array.isArray(payload && payload.bulletPointLocations) ? payload.bulletPointLocations : [];
+    if (!locations.length) {
+      return '<div class="json-hint">No <code>bullet_point</code> attributes found in this package.</div>';
+    }
+    const rows = locations.map((loc) => {
+      const source = loc.submissionUuid ? `${loc.source} (${String(loc.submissionUuid).slice(0, 8)})` : loc.source;
+      const count = Array.isArray(loc.value) ? loc.value.length : '';
+      const first = Array.isArray(loc.value) && loc.value[0] && typeof loc.value[0] === 'object'
+        ? Object.keys(loc.value[0]).join(', ')
+        : '';
+      return `<tr><td><code>${esc(source || '')}</code></td><td><code>${esc(loc.path || '')}</code></td><td>${esc(count)}</td><td>${esc(first)}</td></tr>`;
+    }).join('');
+    return `<div class="json-summary">
+      <h4>Bullet / feature structure</h4>
+      <p>Amazon bullets are submitted as <code>bullet_point</code>: an array of value objects, usually containing <code>value</code>, <code>language_tag</code>, and <code>marketplace_id</code>.</p>
+      <table class="json-summary-table"><thead><tr><th>Source</th><th>Path</th><th>Items</th><th>Object keys</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>`;
+  }
+
+  function openJsonModal(title, subtitle, payload) {
+    jsonModalPayload = payload;
+    if (jsonSubtitle) jsonSubtitle.textContent = subtitle || '';
+    const titleEl = $('#jsonModalTitle');
+    if (titleEl) titleEl.textContent = title || 'JSON package';
+    if (jsonStatus) jsonStatus.textContent = '';
+    if (jsonBody) {
+      jsonBody.innerHTML = bulletSummary(payload)
+        + '<div class="json-section"><h4>Actual JSON</h4>'
+        + `<pre class="json-viewer">${esc(prettyJson(payload))}</pre></div>`;
+    }
+    if (jsonOverlay) jsonOverlay.hidden = false;
+  }
+
+  function closeJsonModal() {
+    if (jsonOverlay) jsonOverlay.hidden = true;
+    jsonModalPayload = null;
+  }
+
+  async function copyJsonModal() {
+    if (!jsonModalPayload) return;
+    const text = prettyJson(jsonModalPayload);
+    try {
+      await navigator.clipboard.writeText(text);
+      if (jsonStatus) jsonStatus.textContent = 'Copied JSON.';
+    } catch (_) {
+      if (jsonStatus) jsonStatus.textContent = 'Copy failed; select the JSON text manually.';
+    }
+  }
+
+  async function showSubmissionJson(uuid) {
+    const payload = await api(`/admin/submissions/${encodeURIComponent(uuid)}/package`);
+    const s = payload.submission || {};
+    openJsonModal('Submission JSON package', `${s.asin || ''} · ${s.sku || ''} · ${s.marketplaceCode || ''} · ${s.productType || ''}`, payload);
+  }
+
+  async function showGroupJson(groupId) {
+    const uuids = (groupSubs.get(groupId) || []).map((s) => s.submission_uuid).filter(Boolean);
+    if (!uuids.length) return;
+    const payload = await apiPost('/admin/group/package', { uuids });
+    openJsonModal('Grouped submissions JSON', `${payload.count || uuids.length} submission(s)`, payload);
+  }
+
+  async function showJobJson(jobId) {
+    const payload = await api(`/admin/jobs/${encodeURIComponent(jobId)}/package`, { timeoutMs: API_BULK_TIMEOUT_MS });
+    const j = payload.job || {};
+    openJsonModal('Job JSON package', `${j.kind || ''} · ${j.asin || ''} · ${j.marketplaceCode || ''}`, payload);
   }
 
   function formatDuration(seconds) {
@@ -222,10 +301,10 @@
         [`Jobs (${w}h)`, String(j24.total || 0), jobsInProgress ? 'warn' : (j24.total ? 'pos' : ''),
           `${j24.running || 0} running · ${finished} finished`],
         ['Active submissions', String(active), active ? 'warn' : '',
-          `${m.submissionsPendingApproval} awaiting approval · ${m.submissionsInFlight} in flight`],
+          `${m.submissionsPendingApproval} awaiting approval · ${m.submissionsQueued || 0} queued · ${m.submissionsInFlight} in flight`],
         ['Job speed', speed ? `${speed}/min` : '0/min', speed ? 'pos' : '', speedDetail],
         ['Est. completion', etaText, etaTone,
-          m.approvalQueueDepth ? `${m.approvalQueueDepth} queued for SP-API` : 'No queued writes']
+          m.submissionsQueued ? `${m.submissionsQueued} queued for SP-API` : 'No queued writes']
       ];
       $('#metricsGrid').innerHTML = cells.map(([k, v, tone, detail]) =>
         `<div class="kpi${tone ? ' kpi-' + tone : ''}">` +
@@ -572,9 +651,18 @@
   // grouped detail table). Reuses the existing `button.act` click handler.
   function rowActions(uuid) {
     return `<div style="display:inline-flex;gap:4px;align-items:center;">
+        <button class="btn-ghost payload-btn" data-uuid="${esc(uuid)}" title="View actual JSON package">JSON</button>
         <button class="btn-ghost btn-ghost--success act approve" data-uuid="${esc(uuid)}" title="Approve">${CHECK_SVG} Approve</button>
         <button class="btn-ghost btn-ghost--danger act reject" data-uuid="${esc(uuid)}" title="Reject">${X_SVG} Reject</button>
       </div>`;
+  }
+
+  function jsonRowAction(uuid) {
+    return `<button class="btn-ghost payload-btn" data-uuid="${esc(uuid)}" title="View actual JSON package">JSON</button>`;
+  }
+
+  function jsonGroupAction(groupId) {
+    return `<button class="btn-ghost payload-btn" data-group="${esc(groupId)}" title="View JSON packages for this group">JSON</button>`;
   }
 
   // Compact, persisted error diagnostics for a submission. Combines the human
@@ -767,7 +855,7 @@
         case 'updated_at': return `<td>${esc(r.updated_at || '')}</td>`;
         case 'error': return `<td class="err">${errorCellHtml(r)}</td>`;
         case 'actions': {
-          const actions = r.status === 'PENDING_APPROVAL' ? rowActions(uuid) : '';
+          const actions = r.status === 'PENDING_APPROVAL' ? rowActions(uuid) : jsonRowAction(uuid);
           return `<td class="actions">${actions}</td>`;
         }
         default: return '<td></td>';
@@ -780,10 +868,11 @@
     const approvers = [...new Set(items.map((i) => i.approved_by).filter(Boolean))].join(', ');
     const groupActions = pending
       ? `<div style="display:inline-flex;gap:4px;align-items:center;">
+          ${jsonGroupAction(id)}
           <button class="btn-ghost btn-ghost--success gact approve" data-group="${esc(id)}" data-count="${pending}" title="Approve all pending">${CHECK_SVG} Approve all</button>
           <button class="btn-ghost btn-ghost--danger gact reject" data-group="${esc(id)}" data-count="${pending}" title="Reject all pending">${X_SVG} Reject all</button>
         </div>`
-      : '';
+      : jsonGroupAction(id);
     const vendorLabel = `${vendorCount || items.length} vendor code${(vendorCount || items.length) === 1 ? '' : 's'}`;
     switch (key) {
       case 'select': {
@@ -1684,7 +1773,8 @@
     { key: 'target_count', label: 'Total', sortable: true, filterable: true },
     { key: 'pending_approval', label: 'Pending approval', sortable: true, filterable: true },
     { key: 'status', label: 'Status', sortable: true, filterable: true },
-    { key: 'requested_by', label: 'Requested by', sortable: true, filterable: true }
+    { key: 'requested_by', label: 'Requested by', sortable: true, filterable: true },
+    { key: 'json', label: 'JSON', nohide: true, sortable: false, filterable: false, fixed: true }
   ];
   const JOBS_COL_KEYS = JOBS_COLUMN_DEFS.map((c) => c.key);
   const JOBS_STORAGE = {
@@ -1754,8 +1844,9 @@
       if (!base.includes(k)) base.push(k);
     }
     const fixedStart = ['select'];
-    const middle = base.filter((k) => JOBS_COL_KEYS.includes(k) && !fixedStart.includes(k));
-    return fixedStart.concat(middle);
+    const fixedEnd = ['json'];
+    const middle = base.filter((k) => JOBS_COL_KEYS.includes(k) && !fixedStart.includes(k) && !fixedEnd.includes(k));
+    return fixedStart.concat(middle, fixedEnd.filter((k) => JOBS_COL_KEYS.includes(k)));
   }
   function visibleJobsColumns() {
     return fullJobsColumnOrder()
@@ -1793,6 +1884,7 @@
       case 'target_count': return String(j.targetCount ?? '');
       case 'pending_approval': return String(j.pendingApprovalCount ?? '');
       case 'requested_by': return String(j.requestedBy || '');
+      case 'json': return '';
       case 'status': return String(j.status || '');
       default: return j[key] == null ? '' : String(j[key]);
     }
@@ -1860,6 +1952,7 @@
       case 'pending_approval': return `<td>${esc(pendingApprovalCount)}</td>`;
       case 'status': return `<td>${statusBadge(j.status)}</td>`;
       case 'requested_by': return `<td>${esc(j.requestedBy || '')}</td>`;
+      case 'json': return `<td class="actions"><button class="btn-ghost payload-job-btn" data-job-id="${esc(jobId)}" title="View job JSON package">JSON</button></td>`;
       default: return '<td></td>';
     }
   }
@@ -1941,7 +2034,7 @@
       }
       if (!col.fixed) {
         columnUi.wireColumnDrag(th, {
-          canDrag: (el) => el.dataset.col !== 'select',
+          canDrag: (el) => el.dataset.col !== 'select' && el.dataset.col !== 'json',
           onReorder: (srcKey, targetKey, insertBefore) => {
             applyJobsColumnReorder(srcKey, targetKey, insertBefore);
           }
@@ -1952,11 +2045,11 @@
   }
 
   function applyJobsColumnReorder(srcKey, targetKey, insertBefore) {
-    if (srcKey === 'select' || targetKey === 'select') return;
+    if (srcKey === 'select' || srcKey === 'json' || targetKey === 'select' || targetKey === 'json') return;
     const visible = visibleJobsColumns().map((c) => c.key);
     const full = fullJobsColumnOrder();
     const hidden = full.filter((k) => !visible.includes(k));
-    const order = visible.filter((k) => k !== 'select');
+    const order = visible.filter((k) => k !== 'select' && k !== 'json');
     const from = order.indexOf(srcKey);
     if (from < 0) return;
     order.splice(from, 1);
@@ -1964,7 +2057,7 @@
     if (to < 0) return;
     if (!insertBefore) to++;
     order.splice(to, 0, srcKey);
-    jobsColState.order = ['select', ...order].concat(hidden.filter((k) => k !== 'select'));
+    jobsColState.order = ['select', ...order, 'json'].concat(hidden.filter((k) => k !== 'select' && k !== 'json'));
     saveJobsOrder();
     renderJobsTable();
   }
@@ -2316,6 +2409,22 @@
     return codes.join(', ');
   }
 
+  // Coloured pill for the server-classified error Type (full data missing /
+  // master data / rule issue). The tooltip surfaces the missing-field count.
+  function errorTypeCell(rec) {
+    const type = rec.errorType || 'unknown';
+    const label = rec.errorTypeLabel || 'Unknown';
+    const tone = type === 'full_data_missing' ? 'bad'
+      : type === 'master_data' ? 'warn'
+      : type === 'rule_issue' ? 'ok' : '';
+    const n = rec.missingFieldCount;
+    const title = type === 'full_data_missing' || type === 'master_data'
+      ? `${n} required field${n === 1 ? '' : 's'} missing`
+      : type === 'rule_issue' ? 'No required field missing — submitted value rejected by a rule'
+      : 'Not enough detail to classify';
+    return `<span class="badge ${tone}" title="${esc(title)}">${esc(label)}</span>`;
+  }
+
   // Errors tab state for the AI resolver: the latest fetched error records
   // (keyed by submission_uuid) and whether the resolver feature is enabled.
   const errorsByUuid = new Map();
@@ -2363,6 +2472,7 @@
     { key: 'select', label: '', fixed: true, sortable: false, filterable: false },
     { key: 'created_at', label: 'Created', sortable: true, filterable: true },
     { key: 'status', label: 'Status', sortable: true, filterable: true },
+    { key: 'type', label: 'Type', sortable: true, filterable: true },
     { key: 'asin', label: 'ASIN', sortable: true, filterable: true },
     { key: 'sku', label: 'SKU', sortable: true, filterable: true },
     { key: 'marketplace_code', label: 'Mkt', sortable: true, filterable: true },
@@ -2453,6 +2563,7 @@
   function errorFilterValue(r, key) {
     switch (key) {
       case 'created_at': return r.created_at || '';
+      case 'type': return r.errorTypeLabel || 'Unknown';
       case 'codes': return errorCodes(r);
       case 'message': {
         const details = Array.isArray(r.errorDetails) ? r.errorDetails : [];
@@ -2523,6 +2634,7 @@
       }
       case 'created_at': return `<td>${esc(r.created_at || '')}</td>`;
       case 'status': return `<td>${statusBadge(r.status)}</td>`;
+      case 'type': return `<td>${errorTypeCell(r)}</td>`;
       case 'asin': return `<td>${esc(r.asin || '')}</td>`;
       case 'sku': return `<td>${esc(r.sku || '')}</td>`;
       case 'marketplace_code': return `<td>${esc(r.marketplace_code || '')}</td>`;
@@ -2931,8 +3043,9 @@
     const changed = (r.changedAttrNames && r.changedAttrNames.length)
       ? `<div class="ai-section"><h4>Attributes changed</h4><p>${r.changedAttrNames.map((n) => `<code>${esc(n)}</code>`).join(' ')}</p></div>`
       : '';
+    const isRepurposed = (src) => /^(sibling:|amazon-catalog:|sibling-asin-record)/.test(String(src || ''));
     const valueSources = (r.valueSources && typeof r.valueSources === 'object' && Object.keys(r.valueSources).length)
-      ? `<div class="ai-section"><h4>Value sources (where each value came from)</h4><ul>${Object.entries(r.valueSources).map(([attr, src]) => `<li><code>${esc(attr)}</code> &larr; ${esc(String(src))}</li>`).join('')}</ul></div>`
+      ? `<div class="ai-section"><h4>Value sources (where each value came from)</h4><ul>${Object.entries(r.valueSources).map(([attr, src]) => `<li><code>${esc(attr)}</code> &larr; ${esc(String(src))}${isRepurposed(src) ? ' <span class="badge warn" title="Borrowed from another record of this ASIN \u2014 review before approving">repurposed</span>' : ''}</li>`).join('')}</ul></div>`
       : '';
     const unresolved = listBlock('Unresolved (needs data the model could not source)', r.unresolved, 'warn');
     const warnings = listBlock('Warnings', r.warnings, 'warn');
@@ -3148,7 +3261,11 @@
   const aiModalClose = $('#aiModalClose');
   if (aiModalClose) aiModalClose.addEventListener('click', closeAiModal);
   if (aiOverlay) aiOverlay.addEventListener('click', (e) => { if (e.target === aiOverlay) closeAiModal(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && aiOverlay && !aiOverlay.hidden) closeAiModal(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (jsonOverlay && !jsonOverlay.hidden) closeJsonModal();
+    if (aiOverlay && !aiOverlay.hidden) closeAiModal();
+  });
 
   const reviewAllBtn = $('#reviewAllErrors');
   if (reviewAllBtn) reviewAllBtn.addEventListener('click', reviewAllErrors);
@@ -3162,6 +3279,12 @@
   if (retrySelectedBtn) retrySelectedBtn.addEventListener('click', retrySelectedErrors);
   const errorsFiltersClear = $('#errorsColumnFiltersClear');
   if (errorsFiltersClear) errorsFiltersClear.addEventListener('click', clearAllErrorColumnFilters);
+
+  const jsonModalClose = $('#jsonModalClose');
+  const jsonCopyBtn = $('#jsonCopyBtn');
+  if (jsonModalClose) jsonModalClose.addEventListener('click', closeJsonModal);
+  if (jsonCopyBtn) jsonCopyBtn.addEventListener('click', copyJsonModal);
+  if (jsonOverlay) jsonOverlay.addEventListener('click', (e) => { if (e.target === jsonOverlay) closeJsonModal(); });
 
   document.querySelectorAll('#errorsSubtabs .view-subtab').forEach((btn) => {
     btn.addEventListener('click', () => setErrorsView(btn.dataset.errorsView));
@@ -3273,6 +3396,19 @@
   });
   $('#approveSelectedJobs').addEventListener('click', approveSelectedJobs);
 
+  $('#jobsTable tbody').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button.payload-job-btn');
+    if (!btn) return;
+    btn.disabled = true;
+    try {
+      await showJobJson(btn.dataset.jobId);
+    } catch (err) {
+      if (err.message !== '401') alert('Load job JSON failed: ' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   // ── Sidebar (hamburger) navigation drawer ────────────────────────────────
   const sidebar = $('#sidebar');
   const overlay = $('#sidebarOverlay');
@@ -3358,6 +3494,20 @@
     if (!row) return;
     if (caret.dataset.group) toggleGroupChanges(row, caret.dataset.group);
     else toggleChanges(row, caret.dataset.uuid);
+  });
+
+  $('#queueTable tbody').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button.payload-btn');
+    if (!btn) return;
+    btn.disabled = true;
+    try {
+      if (btn.dataset.group) await showGroupJson(btn.dataset.group);
+      else await showSubmissionJson(btn.dataset.uuid);
+    } catch (err) {
+      if (err.message !== '401') alert('Load submission JSON failed: ' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   // Approve / reject the whole group (every pending submission for one item

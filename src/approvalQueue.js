@@ -2,6 +2,7 @@
 // submissions at once, but each resulting SP-API write should run one after the
 // other so a bulk click does not burst into Amazon and cause avoidable 429s.
 const forwarder = require('./forwarder');
+const submissions = require('./submissions');
 const { recomputeJobStatus } = require('./jobOrchestrator');
 
 let tail = Promise.resolve();
@@ -11,7 +12,9 @@ function enqueue(submission) {
   pending += 1;
   const task = tail.then(async () => {
     try {
-      const settled = await forwarder.forward(submission);
+      const inFlight = submissions.update(submission.submission_uuid, { status: 'IN_PROGRESS' })
+        || { ...submission, status: 'IN_PROGRESS' };
+      const settled = await forwarder.forward(inFlight);
       recomputeJobStatus(submission.job_uuid);
       return settled;
     } catch (err) {

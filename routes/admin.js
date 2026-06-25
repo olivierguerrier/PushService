@@ -239,6 +239,110 @@ function formatQueueRows(raw, { lite = false } = {}) {
   });
 }
 
+function parseJsonField(value) {
+  if (value == null || value === '') return null;
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch (_) { return { raw: value, parseError: true }; }
+}
+
+function collectBulletPointLocations(value, { source, path = '$', out = [] } = {}) {
+  if (value == null) return out;
+  if (Array.isArray(value)) {
+    value.forEach((entry, i) => collectBulletPointLocations(entry, { source, path: `${path}[${i}]`, out }));
+    return out;
+  }
+  if (typeof value !== 'object') return out;
+  for (const [key, child] of Object.entries(value)) {
+    const childPath = `${path}.${key}`;
+    if (key === 'bullet_point') out.push({ source, path: childPath, value: child });
+    if (key === 'path' && child === '/attributes/bullet_point' && Object.prototype.hasOwnProperty.call(value, 'value')) {
+      out.push({ source, path: `${path}.value`, patchPath: child, value: value.value });
+    }
+    collectBulletPointLocations(child, { source, path: childPath, out });
+  }
+  return out;
+}
+
+function submissionPayloadEnvelope(s) {
+  const requestBody = parseJsonField(s.request_body_json);
+  const rawPackage = parseJsonField(s.raw_package_json);
+  const sourceSnapshot = parseJsonField(s.source_snapshot_json);
+  const priorState = parseJsonField(s.prior_state_json);
+  const amazonResponse = parseJsonField(s.amazon_response_json);
+  const meta = parseJsonField(s.flyapp_meta_json);
+  const bulletPointLocations = [
+    ...collectBulletPointLocations(requestBody, { source: 'requestBody' }),
+    ...collectBulletPointLocations(rawPackage, { source: 'rawPackage' })
+  ];
+  return {
+    submission: {
+      submissionUuid: s.submission_uuid,
+      jobUuid: s.job_uuid,
+      caller: s.caller,
+      scope: s.scope,
+      operation: s.operation,
+      payloadOrigin: s.payload_origin,
+      vendorCode: s.vendor_code,
+      sku: s.sku,
+      effectiveSku: s.effective_sku,
+      parentSku: s.parent_sku,
+      asin: s.asin,
+      itemNumber: s.item_number,
+      marketplaceCode: s.marketplace_code,
+      productType: s.product_type,
+      status: s.status,
+      createdAt: s.created_at,
+      updatedAt: s.updated_at
+    },
+    requestBody,
+    rawPackage,
+    sourceSnapshot,
+    priorState,
+    amazonResponse,
+    meta,
+    bulletPointLocations
+  };
+}
+
+function jobPayloadEnvelope(job) {
+  const requestPayload = parseJsonField(job.request_payload_json);
+  const fieldNames = parseJsonField(job.field_names_json);
+  const resultSummary = parseJsonField(job.result_summary_json);
+  const childRows = submissions.listForJob(job.job_uuid);
+  return {
+    job: {
+      jobUuid: job.job_uuid,
+      kind: job.kind,
+      caller: job.caller,
+      requestedBy: job.requested_by,
+      asin: job.asin,
+      itemNumber: job.item_number,
+      marketplaceCode: job.marketplace_code,
+      productType: job.product_type,
+      label: job.label,
+      status: job.status,
+      okCount: job.ok_count,
+      failedCount: job.failed_count,
+      targetCount: job.target_count,
+      createdAt: job.created_at,
+      startedAt: job.started_at,
+      completedAt: job.completed_at,
+      updatedAt: job.updated_at
+    },
+    requestPayload,
+    fieldNames,
+    resultSummary,
+    submissions: childRows.map(submissionPayloadEnvelope),
+    bulletPointLocations: [
+      ...collectBulletPointLocations(requestPayload, { source: 'job.requestPayload' }),
+      ...childRows.flatMap((s) => submissionPayloadEnvelope(s).bulletPointLocations.map((loc) => ({
+        ...loc,
+        submissionUuid: s.submission_uuid
+      })))
+    ]
+  };
+}
+
 // Recent submissions for the console. Supports keyset pagination so the UI can
 // load the full history in batches: pass `beforeId` (the `nextBeforeId` from the
 // previous response) to fetch the next, older page. `total` lets the client know
@@ -274,6 +378,26 @@ router.get('/admin/queue', adminAuth, (req, res) => {
   res.json({ submissions: rows, total: submissions.count(), nextBeforeId, highWaterId });
 });
 
+router.get('/admin/submissions/:uuid/package', adminAuth, (req, res) => {
+  const submission = submissions.getByUuid(req.params.uuid);
+  if (!submission) return res.status(404).json({ error: 'submission_not_found' });
+  res.json(submissionPayloadEnvelope(submission));
+});
+
+router.post('/admin/group/package', adminAuth, express.json(), (req, res) => {
+  const rows = resolveUuidBatch(req.body);
+  if (!rows.length) return res.status(400).json({ error: 'no_submissions' });
+  const payloads = rows.map(submissionPayloadEnvelope);
+  res.json({
+    count: payloads.length,
+    submissions: payloads,
+    bulletPointLocations: payloads.flatMap((p) => p.bulletPointLocations.map((loc) => ({
+      ...loc,
+      submissionUuid: p.submission.submissionUuid
+    })))
+  });
+});
+
 // Per-field change details for one submission: flyapp source value -> submitted
 // value, for each changed attribute. Read-only; used by the console's
 // expandable submission row.
@@ -298,13 +422,14 @@ function operatorName(req) {
   return 'operator';
 }
 
-// Flip one held submission to IN_PROGRESS and forward it to Amazon in the
+// Flip one held submission to QUEUED; the serial worker marks it IN_PROGRESS
+// only once it starts forwarding to Amazon.
 // background so the click isn't blocked on the SP-API round-trip. Shared by the
 // single-submission endpoint and the group ("approve all") endpoint. Assumes
 // the caller has already checked status === 'PENDING_APPROVAL'.
 function approveOne(submission, actor, { via = 'console' } = {}) {
   const approved = submissions.update(submission.submission_uuid, {
-    status: 'IN_PROGRESS', approved_by: actor, approved_at: new Date().toISOString()
+    status: 'QUEUED', approved_by: actor, approved_at: new Date().toISOString()
   });
   audit.record({ event: 'approved', submissionUuid: approved.submission_uuid, actor, details: { via } });
   approvalQueue.enqueue(approved);
@@ -321,7 +446,7 @@ function rejectOne(submission, actor, { via = 'console' } = {}) {
   return rejected;
 }
 
-// In-app approval: flip a held submission to IN_PROGRESS and forward it to
+// In-app approval: flip a held submission to QUEUED and forward it to
 // Amazon. This is the operator-console equivalent of the emailed approval link.
 router.post('/admin/submissions/:uuid/approve', adminAuth, async (req, res, next) => {
   try {
@@ -331,7 +456,7 @@ router.post('/admin/submissions/:uuid/approve', adminAuth, async (req, res, next
       return res.status(409).json({ error: 'not_pending_approval', status: submission.status });
     }
     const approved = approveOne(submission, operatorName(req));
-    res.json({ ok: true, submissionId: approved.submission_uuid, status: 'IN_PROGRESS' });
+    res.json({ ok: true, submissionId: approved.submission_uuid, status: approved.status });
   } catch (err) { next(err); }
 });
 
@@ -525,6 +650,12 @@ router.get('/admin/jobs', adminAuth, (req, res) => {
   res.json({ jobs: rows, total: jobs.count(countOpts), nextBeforeId });
 });
 
+router.get('/admin/jobs/:uuid/package', adminAuth, (req, res) => {
+  const job = jobs.getByUuid(req.params.uuid);
+  if (!job) return res.status(404).json({ error: 'job_not_found' });
+  res.json(jobPayloadEnvelope(job));
+});
+
 // CSV export of all jobs (optionally filtered by search). The console passes
 // the operator JWT via ?token= since <a> downloads can't set Authorization.
 router.get('/admin/jobs/export', adminAuth, (req, res) => {
@@ -546,6 +677,9 @@ router.get('/admin/errors', adminAuth, async (req, res, next) => {
   try {
     const records = errorReport.listErrorSubmissions({ limit: req.query.limit || 1000 }).map(errorReport.toRecord);
     await errorTranslation.enrichRecords(records);
+    // Re-classify the error Type now that English copies are attached (refines
+    // value-vs-missing detection for non-English markets).
+    records.forEach(errorReport.attachErrorType);
     // Attach any existing AI-resolution state so the Errors tab can render a
     // per-row badge ("AI: proposed / applied / rejected") in a single query.
     const resState = aiResolutions.statusMap(records.map((r) => r.submission_uuid));

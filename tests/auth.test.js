@@ -29,6 +29,26 @@ test('seedUserCache makes findActiveUserByIdCached return without calling Listin
   }
 });
 
+test('a freshly logged-in user is not booted when /auth/verify omits is_active', async () => {
+  // The LA bridge's verify endpoint only returns active accounts and omits the
+  // is_active flag. seedUserCache must treat that as active so the operator's
+  // first authenticated request (served from the seeded cache) is not 401'd.
+  const verifyUser = { id: 11, username: 'op', role: 'admin', full_name: 'Op' }; // no is_active
+  auth.seedUserCache(verifyUser);
+
+  const token = auth.signAdminJwt(verifyUser);
+  const req = { headers: { authorization: `Bearer ${token}` }, query: {} };
+  let statusCode = null;
+  const res = { status(code) { statusCode = code; return { json() {} }; } };
+
+  await new Promise((resolve, reject) => {
+    auth.adminAuth(req, res, (err) => (err ? reject(err) : resolve()));
+  });
+
+  assert.equal(statusCode, null, 'should not respond with an error status');
+  assert.equal(req.admin.username, 'op');
+});
+
 test('findActiveUserByIdCached serves stale row immediately when cache expired', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: 0 });
 

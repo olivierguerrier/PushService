@@ -7,7 +7,7 @@ const audit = require('./audit/auditEvents');
 
 const TERMINAL_OK = new Set(['APPLIED']);
 const TERMINAL_FAIL = new Set(['FAILED', 'REJECTED', 'EXPIRED', 'BLOCKED']);
-const PENDING = new Set(['PENDING_APPROVAL', 'IN_PROGRESS', 'SUBMITTED']);
+const PENDING = new Set(['PENDING_APPROVAL', 'QUEUED', 'IN_PROGRESS', 'SUBMITTED']);
 
 function recomputeJobStatus(jobUuid) {
   if (!jobUuid) return null;

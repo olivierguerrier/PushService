@@ -58,7 +58,14 @@ let laCircuitOpenUntil = 0;
 
 function seedUserCache(user) {
   if (!user || user.id == null) return;
-  userCache.set(user.id, { row: user, expiresAt: Date.now() + USER_CACHE_TTL_MS });
+  // The ListingApp bridge's /auth/verify only ever returns accounts that are
+  // already active, so its user object omits `is_active`. adminAuth gates every
+  // request on `current.is_active`, so seeding the bare verify-row as-is would
+  // boot the operator on their very first request (undefined is falsy). A
+  // freshly verified user IS active by the bridge's contract — default it so,
+  // without clobbering an explicit flag from a richer source (e.g. getUser).
+  const row = user.is_active == null ? { ...user, is_active: true } : user;
+  userCache.set(user.id, { row, expiresAt: Date.now() + USER_CACHE_TTL_MS });
 }
 
 function tripLaCircuit() {

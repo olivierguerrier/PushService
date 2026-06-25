@@ -158,6 +158,29 @@ function listForJob(jobUuid) {
   return getDb().prepare('SELECT * FROM push_submissions WHERE job_uuid = ? ORDER BY id ASC').all(jobUuid);
 }
 
+// Accepted submissions for an ASIN, used to repurpose attribute values from
+// other records of the same ASIN (different vendor code / SKU / marketplace).
+// Only APPLIED rows are returned (their attributes actually reached Amazon).
+// Ranked so a row matching BOTH the target marketplace and product type wins,
+// then same marketplace, then same product type, then any — most recent first
+// within each tier — so the closest, freshest sibling is consulted first.
+function listAcceptedByAsin(asin, { excludeUuid = null, marketplaceCode = null, productType = null, limit = 50 } = {}) {
+  if (!asin) return [];
+  const cap = Math.max(1, Math.min(500, Number(limit) || 50));
+  return getDb().prepare(`
+    SELECT submission_uuid, vendor_code, sku, asin, marketplace_code, product_type,
+           request_body_json, prior_state_json, updated_at
+    FROM push_submissions
+    WHERE asin = ? AND status = 'APPLIED'
+      AND (? IS NULL OR submission_uuid != ?)
+    ORDER BY
+      (CASE WHEN marketplace_code = ? THEN 0 ELSE 1 END),
+      (CASE WHEN product_type = ? THEN 0 ELSE 1 END),
+      id DESC
+    LIMIT ${cap}
+  `).all(asin, excludeUuid, excludeUuid, marketplaceCode, productType);
+}
+
 // Every submission that carries an Amazon error/diagnostic: explicit FAILED
 // rows, anything with an error_message, or a non-empty issues_json (which may
 // also hold WARNING-level diagnostics worth exporting). Includes the raw
@@ -202,5 +225,5 @@ function setArchived(uuid, { archived = true, actor = null } = {}) {
 
 module.exports = {
   insert, getByUuid, getByIdempotencyKey, getByApprovalToken, update,
-  listRecent, listChanges, count, maxId, listForJob, listErrors, setArchived
+  listRecent, listChanges, count, maxId, listForJob, listAcceptedByAsin, listErrors, setArchived
 };
