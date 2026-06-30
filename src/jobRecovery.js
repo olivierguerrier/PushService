@@ -10,6 +10,11 @@ const { recomputeJobStatus } = require('./jobOrchestrator');
 
 const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
 
+// Per-row audit events use a hash-chained SQLite transaction — fine for a
+// handful of resumes, but thousands of sync writes block the event loop for
+// minutes and freeze the operator UI. Bulk boot resume logs one summary event.
+const BULK_RESUME_AUDIT_THRESHOLD = 50;
+
 function listInterruptedForwards() {
   return getDb().prepare(`
     SELECT * FROM push_submissions
@@ -38,15 +43,28 @@ function resumeInterruptedForwards() {
 async function resumeInterruptedForwardsAsync({ batchSize = 25 } = {}) {
   const rows = listInterruptedForwards();
   const summary = { scanned: rows.length, resumed: 0 };
+  if (!rows.length) return summary;
+
+  const bulk = rows.length > BULK_RESUME_AUDIT_THRESHOLD;
+  if (bulk) {
+    audit.record({
+      event: 'boot_bulk_submission_resume',
+      actor: 'system',
+      details: { count: rows.length }
+    });
+  }
+
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
-    audit.record({
-      event: 'submission_resumed_at_boot',
-      submissionUuid: row.submission_uuid,
-      jobUuid: row.job_uuid,
-      actor: 'system',
-      details: { operation: row.operation }
-    });
+    if (!bulk) {
+      audit.record({
+        event: 'submission_resumed_at_boot',
+        submissionUuid: row.submission_uuid,
+        jobUuid: row.job_uuid,
+        actor: 'system',
+        details: { operation: row.operation }
+      });
+    }
     approvalQueue.enqueue(row);
     summary.resumed += 1;
     if ((i + 1) % batchSize === 0) await yieldToEventLoop();

@@ -34,7 +34,11 @@ const router = express.Router();
 
 const newUuid = () => crypto.randomUUID();
 const newApprovalToken = () => crypto.randomBytes(24).toString('hex');
-const headerIdemKey = (req) => req.headers['idempotency-key'] || req.headers['Idempotency-Key'] || null;
+const headerIdemKey = (req) => {
+  const h = req && req.headers;
+  if (!h) return null;
+  return h['idempotency-key'] || h['Idempotency-Key'] || null;
+};
 
 function isContentMatchScope(scope) {
   return String(scope || '').toUpperCase() === 'CONTENT_MATCH';

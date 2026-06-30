@@ -1126,6 +1126,29 @@ tr.row-archived { opacity: 0.55; }
 }
 [data-theme="dark"] .ai-editor { background: rgba(0,0,0,0.25); }
 
+.bulk-progress-modal { width: min(560px, 100%); }
+.bulk-progress-summary {
+  font-weight: var(--font-weight-semibold);
+  margin-bottom: 10px;
+}
+.bulk-progress-track {
+  height: 10px;
+  background: var(--border-color);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+.bulk-progress-bar {
+  height: 100%;
+  width: 0;
+  background: var(--color-primary);
+  transition: width 0.2s ease;
+}
+.bulk-progress-detail {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+}
+
 .json-modal { width: min(1040px, 100%); }
 .json-summary {
   margin-bottom: 14px;

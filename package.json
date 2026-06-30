@@ -11,6 +11,7 @@
     "start": "node server.js",
     "stop": "node scripts/stop.js",
     "restart": "node scripts/restart.js",
+    "seed-vault-cache": "node scripts/seed-vault-cache.js",
     "dev": "nodemon server.js",
     "init-db": "node scripts/init-db.js",
     "replay-audit": "node scripts/replay-audit-log.js",

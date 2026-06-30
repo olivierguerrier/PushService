@@ -7,7 +7,7 @@ const { resolveByCode } = require('../../config/marketplaces');
 const REGION_BY_CODE = {
   US: 'NA', CA: 'NA', MX: 'NA',
   GB: 'EU', DE: 'EU', FR: 'EU', IT: 'EU', ES: 'EU',
-  AE: 'EU', SA: 'EU', SE: 'EU',
+  NL: 'EU', PL: 'EU', AE: 'EU', SA: 'EU', SE: 'EU',
   AU: 'FE', JP: 'FE', SG: 'FE'
 };
 

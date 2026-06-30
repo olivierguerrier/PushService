@@ -18,6 +18,7 @@ const LANGUAGE_GROUPS = {
 const LANGUAGE_TAG_BY_MP = {
   US: 'en_US', CA: 'en_CA', MX: 'es_MX', GB: 'en_GB',
   DE: 'de_DE', FR: 'fr_FR', IT: 'it_IT', ES: 'es_ES',
+  NL: 'nl_NL', PL: 'pl_PL',
   AE: 'en_AE', SA: 'ar_SA', AU: 'en_AU', JP: 'ja_JP',
   SG: 'en_SG', SE: 'sv_SE'
 };

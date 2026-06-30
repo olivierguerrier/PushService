@@ -5,7 +5,6 @@ const { getDb } = require('./db');
 const jobs = require('./jobs');
 const submissions = require('./submissions');
 const audit = require('./audit/auditEvents');
-const approvalQueue = require('./approvalQueue');
 const { recomputeJobStatus } = require('./jobOrchestrator');
 
 function getPushHandlers() {
@@ -91,7 +90,7 @@ async function resumeOneJob(jobRow) {
   });
 
   const { handleTarget, handlePackageTarget, loadContentMatchAsinGate } = getPushHandlers();
-  const req = { caller: job.caller, query: {}, body: {} };
+  const req = { caller: job.caller, headers: {}, query: {}, body: {} };
   const parsed = {
     scope: payload.scope,
     operation: payload.operation,
@@ -135,7 +134,6 @@ async function resumeIncompleteFanOuts() {
       summary.skipped += 1;
     }
   }
-  await approvalQueue.idle();
   return summary;
 }
 

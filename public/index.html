@@ -284,6 +284,30 @@
   <div class="col-selector-overlay" id="queueColSelectorOverlay"></div>
   <div class="col-selector-overlay" id="jobsColSelectorOverlay"></div>
 
+  <!-- Bulk approval progress -->
+  <div id="bulkProgressOverlay" class="ai-modal-overlay" hidden>
+    <div class="ai-modal bulk-progress-modal" role="dialog" aria-modal="true" aria-labelledby="bulkProgressTitle">
+      <div class="ai-modal-header">
+        <div>
+          <h3 id="bulkProgressTitle">Approving submissions</h3>
+          <div class="ai-modal-subtitle" id="bulkProgressSubtitle"></div>
+        </div>
+      </div>
+      <div class="ai-modal-body">
+        <div class="bulk-progress-summary" id="bulkProgressSummary">Preparing approval batches...</div>
+        <div class="bulk-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="bulkProgressBar" class="bulk-progress-bar"></div>
+        </div>
+        <div class="bulk-progress-detail" id="bulkProgressDetail"></div>
+      </div>
+      <div class="ai-modal-footer">
+        <span id="bulkProgressStatus" class="bulk-status"></span>
+        <span class="ai-modal-footer-spacer"></span>
+        <button id="bulkProgressClose" class="btn-ghost" type="button" disabled>Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Raw package / request JSON viewer -->
   <div id="jsonModalOverlay" class="ai-modal-overlay" hidden>
     <div class="ai-modal json-modal" role="dialog" aria-modal="true" aria-labelledby="jsonModalTitle">
@@ -326,6 +350,6 @@
 
   <script src="/col-filter.js?v=20260617-1"></script>
   <script src="/column-ui.js?v=20260617-1"></script>
-  <script src="/app.js?v=20260623-5"></script>
+  <script src="/app.js?v=20260630-1"></script>
 </body>
 </html>

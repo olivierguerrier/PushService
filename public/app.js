@@ -59,6 +59,7 @@
 
   const API_TIMEOUT_MS = 20000;
   const API_BULK_TIMEOUT_MS = 90000;
+  const APPROVAL_BATCH_SIZE = 25;
   async function fetchWithTimeout(url, opts, timeoutMs = API_TIMEOUT_MS) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -154,6 +155,15 @@
   const jsonBody = $('#jsonModalBody');
   const jsonSubtitle = $('#jsonModalSubtitle');
   const jsonStatus = $('#jsonModalStatus');
+  const bulkProgressOverlay = $('#bulkProgressOverlay');
+  const bulkProgressTitle = $('#bulkProgressTitle');
+  const bulkProgressSubtitle = $('#bulkProgressSubtitle');
+  const bulkProgressSummary = $('#bulkProgressSummary');
+  const bulkProgressDetail = $('#bulkProgressDetail');
+  const bulkProgressStatus = $('#bulkProgressStatus');
+  const bulkProgressBar = $('#bulkProgressBar');
+  const bulkProgressTrack = bulkProgressOverlay && bulkProgressOverlay.querySelector('.bulk-progress-track');
+  const bulkProgressClose = $('#bulkProgressClose');
 
   function prettyJson(value) {
     return JSON.stringify(value, null, 2);
@@ -196,6 +206,83 @@
   function closeJsonModal() {
     if (jsonOverlay) jsonOverlay.hidden = true;
     jsonModalPayload = null;
+  }
+
+  function openBulkProgress({ title, subtitle, total }) {
+    if (bulkProgressTitle) bulkProgressTitle.textContent = title || 'Processing approvals';
+    if (bulkProgressSubtitle) bulkProgressSubtitle.textContent = subtitle || '';
+    if (bulkProgressSummary) bulkProgressSummary.textContent = `Preparing ${total.toLocaleString()} approval${total === 1 ? '' : 's'}...`;
+    if (bulkProgressDetail) bulkProgressDetail.textContent = '';
+    if (bulkProgressStatus) {
+      bulkProgressStatus.textContent = 'Working...';
+      bulkProgressStatus.style.color = '';
+    }
+    if (bulkProgressBar) bulkProgressBar.style.width = '0%';
+    if (bulkProgressTrack) bulkProgressTrack.setAttribute('aria-valuenow', '0');
+    if (bulkProgressClose) bulkProgressClose.disabled = true;
+    if (bulkProgressOverlay) bulkProgressOverlay.hidden = false;
+  }
+
+  function updateBulkProgress({ processed, total, approved, skipped, message, tone }) {
+    const pct = total ? Math.round((processed / total) * 100) : 0;
+    if (bulkProgressSummary) {
+      bulkProgressSummary.textContent = `${processed.toLocaleString()} of ${total.toLocaleString()} processed`;
+    }
+    if (bulkProgressDetail) {
+      bulkProgressDetail.textContent = `${approved.toLocaleString()} queued · ${skipped.toLocaleString()} skipped · batches of ${APPROVAL_BATCH_SIZE}`;
+    }
+    if (bulkProgressStatus) {
+      bulkProgressStatus.textContent = message || '';
+      bulkProgressStatus.style.color = tone === 'bad' ? 'var(--color-neg-text)' : tone === 'ok' ? 'var(--color-pos-text)' : '';
+    }
+    if (bulkProgressBar) bulkProgressBar.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+    if (bulkProgressTrack) bulkProgressTrack.setAttribute('aria-valuenow', String(pct));
+  }
+
+  function finishBulkProgress(message, tone) {
+    if (bulkProgressStatus) {
+      bulkProgressStatus.textContent = message || '';
+      bulkProgressStatus.style.color = tone === 'bad' ? 'var(--color-neg-text)' : tone === 'ok' ? 'var(--color-pos-text)' : '';
+    }
+    if (bulkProgressClose) bulkProgressClose.disabled = false;
+  }
+
+  function closeBulkProgress() {
+    if (bulkProgressOverlay && (!bulkProgressClose || !bulkProgressClose.disabled)) bulkProgressOverlay.hidden = true;
+  }
+
+  async function approveUuidsInBatches(uuids, { title, subtitle, onBatchSuccess } = {}) {
+    const total = uuids.length;
+    let approved = 0;
+    let skipped = 0;
+    let processed = 0;
+    openBulkProgress({ title, subtitle, total });
+    for (let start = 0; start < total; start += APPROVAL_BATCH_SIZE) {
+      const batch = uuids.slice(start, start + APPROVAL_BATCH_SIZE);
+      const end = start + batch.length;
+      updateBulkProgress({
+        processed,
+        total,
+        approved,
+        skipped,
+        message: `Approving ${start + 1}-${end} of ${total}...`
+      });
+      const result = await apiPost('/admin/group/approve', { uuids: batch });
+      approved += Number(result.approved) || 0;
+      skipped += Number(result.skipped) || 0;
+      processed += batch.length;
+      if (onBatchSuccess) onBatchSuccess(batch, result);
+      updateBulkProgress({
+        processed,
+        total,
+        approved,
+        skipped,
+        message: `Completed batch ${Math.ceil(end / APPROVAL_BATCH_SIZE)} of ${Math.ceil(total / APPROVAL_BATCH_SIZE)}`
+      });
+    }
+    const summary = `Queued ${approved} approval${approved === 1 ? '' : 's'}; skipped ${skipped}.`;
+    finishBulkProgress(summary, 'ok');
+    return { approved, skipped };
   }
 
   async function copyJsonModal() {
@@ -1192,10 +1279,13 @@
     const status = $('#queueBulkStatus');
     queueBulkBusy = true;
     syncQueueSelectionControls();
-    if (status) status.textContent = 'Queueing approvals...';
+    if (status) status.textContent = `Queueing approvals in batches of ${APPROVAL_BATCH_SIZE}...`;
     try {
-      const result = await apiPost('/admin/group/approve', { uuids });
-      selectedQueueUuids.clear();
+      const result = await approveUuidsInBatches(uuids, {
+        title: 'Approving selected submissions',
+        subtitle: `${uuids.length.toLocaleString()} selected submission${uuids.length === 1 ? '' : 's'} · ${APPROVAL_BATCH_SIZE} per batch`,
+        onBatchSuccess: (batch) => batch.forEach((uuid) => selectedQueueUuids.delete(uuid))
+      });
       queueBulkMessage = `Queued ${result.approved || 0} approval${result.approved === 1 ? '' : 's'}; skipped ${result.skipped || 0}.`;
       if (status) status.textContent = queueBulkMessage;
       await loadQueue();
@@ -1204,6 +1294,7 @@
       if (err.message === '401') return;
       queueBulkMessage = 'Approval failed: ' + err.message;
       if (status) status.textContent = queueBulkMessage;
+      finishBulkProgress(queueBulkMessage, 'bad');
       alert('Approve selected submissions failed: ' + err.message);
     } finally {
       queueBulkBusy = false;
@@ -3265,6 +3356,7 @@
     if (e.key !== 'Escape') return;
     if (jsonOverlay && !jsonOverlay.hidden) closeJsonModal();
     if (aiOverlay && !aiOverlay.hidden) closeAiModal();
+    if (bulkProgressOverlay && !bulkProgressOverlay.hidden) closeBulkProgress();
   });
 
   const reviewAllBtn = $('#reviewAllErrors');
@@ -3285,6 +3377,8 @@
   if (jsonModalClose) jsonModalClose.addEventListener('click', closeJsonModal);
   if (jsonCopyBtn) jsonCopyBtn.addEventListener('click', copyJsonModal);
   if (jsonOverlay) jsonOverlay.addEventListener('click', (e) => { if (e.target === jsonOverlay) closeJsonModal(); });
+  if (bulkProgressClose) bulkProgressClose.addEventListener('click', closeBulkProgress);
+  if (bulkProgressOverlay) bulkProgressOverlay.addEventListener('click', (e) => { if (e.target === bulkProgressOverlay) closeBulkProgress(); });
 
   document.querySelectorAll('#errorsSubtabs .view-subtab').forEach((btn) => {
     btn.addEventListener('click', () => setErrorsView(btn.dataset.errorsView));
@@ -3523,10 +3617,18 @@
     const uuids = (groupSubs.get(groupId) || []).map((s) => s.submission_uuid);
     btn.disabled = true;
     try {
-      await apiPost(`/admin/group/${isApprove ? 'approve' : 'reject'}`, { uuids });
+      if (isApprove) {
+        await approveUuidsInBatches(uuids, {
+          title: 'Approving group submissions',
+          subtitle: `${uuids.length.toLocaleString()} submission${uuids.length === 1 ? '' : 's'} · ${APPROVAL_BATCH_SIZE} per batch`
+        });
+      } else {
+        await apiPost('/admin/group/reject', { uuids });
+      }
       loadQueue();
     } catch (err) {
       if (err.message === '401') return;
+      if (isApprove) finishBulkProgress('Approval failed: ' + err.message, 'bad');
       alert((isApprove ? 'Approve' : 'Reject') + ' all failed: ' + err.message);
       btn.disabled = false;
     }

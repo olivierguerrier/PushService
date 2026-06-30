@@ -28,6 +28,7 @@ const jobs = require('./src/jobs');
 const jobRecovery = require('./src/jobRecovery');
 const jobFanOutResume = require('./src/jobFanOutResume');
 const audit = require('./src/audit/auditEvents');
+const { loadEnvCache } = require('./lib/vaultEnvCache');
 
 function buildApp() {
   const app = express();
@@ -142,7 +143,58 @@ function assertNoTestData() {
   }
 }
 
+// Recomputing thousands of parent job rollups at boot blocks HTTP for minutes.
+const OPEN_JOB_RECOMPUTE_BOOT_MAX = 200;
+
+async function runBootRecovery() {
+  try {
+    const resumed = await jobRecovery.resumeInterruptedForwardsAsync({ batchSize: 10 });
+    if (resumed.resumed) console.log(`[boot] resumed ${resumed.resumed}/${resumed.scanned} interrupted submission(s)`);
+  } catch (err) { console.warn('[boot] submission resume failed:', err.message); }
+  try {
+    const fanout = await jobFanOutResume.resumeIncompleteFanOuts();
+    if (fanout.resumed) console.log(`[boot] resumed fan-out on ${fanout.resumed} job(s), ${fanout.processedTargets} target(s)`);
+  } catch (err) { console.warn('[boot] fan-out resume failed:', err.message); }
+  try {
+    const stuckCount = getDb().prepare(`
+      SELECT COUNT(*) AS n FROM push_jobs
+      WHERE status IN ('pending', 'running')
+        AND COALESCE(started_at, created_at) < datetime('now', '-' || ? || ' minutes')
+    `).get(env.JOB_STALE_MINUTES).n;
+    if (stuckCount > OPEN_JOB_RECOMPUTE_BOOT_MAX) {
+      console.warn(`[boot] deferring stuck-job recovery for ${stuckCount} job(s) (> ${OPEN_JOB_RECOMPUTE_BOOT_MAX})`);
+      void jobs.recoverStuckJobsAsync({ staleAfterMinutes: env.JOB_STALE_MINUTES, batchSize: 10 })
+        .then((recovered) => {
+          if (recovered.recovered) console.log(`[boot] closed ${recovered.recovered}/${recovered.scanned} legacy incomplete job(s)`);
+          if (recovered.leftOpen) console.log(`[boot] left ${recovered.leftOpen} resumable job(s) open`);
+          if (recovered.recomputed) console.log(`[boot] recomputed ${recovered.recomputed} open job(s)`);
+        })
+        .catch((err) => console.warn('[boot] deferred job recovery failed:', err.message));
+    } else {
+      const recovered = await jobs.recoverStuckJobsAsync({ staleAfterMinutes: env.JOB_STALE_MINUTES, batchSize: 10 });
+      if (recovered.recovered) console.log(`[boot] closed ${recovered.recovered}/${recovered.scanned} legacy incomplete job(s)`);
+      if (recovered.leftOpen) console.log(`[boot] left ${recovered.leftOpen} resumable job(s) open`);
+      if (recovered.recomputed) console.log(`[boot] recomputed ${recovered.recomputed} open job(s)`);
+    }
+  } catch (err) { console.warn('[boot] job recovery failed:', err.message); }
+  try {
+    const openCount = getDb().prepare(`SELECT COUNT(*) AS n FROM push_jobs WHERE status IN ('pending', 'running')`).get().n;
+    if (openCount > OPEN_JOB_RECOMPUTE_BOOT_MAX) {
+      console.warn(`[boot] deferring rollup refresh for ${openCount} open job(s) (> ${OPEN_JOB_RECOMPUTE_BOOT_MAX})`);
+      void jobRecovery.recomputeOpenJobsAsync({ batchSize: 10 })
+        .then(({ recomputed }) => {
+          if (recomputed) console.log(`[boot] refreshed ${recomputed} open job rollup(s)`);
+        })
+        .catch((err) => console.warn('[boot] deferred job rollup refresh failed:', err.message));
+    } else {
+      const { recomputed } = await jobRecovery.recomputeOpenJobsAsync({ batchSize: 10 });
+      if (recomputed) console.log(`[boot] refreshed ${recomputed} open job rollup(s)`);
+    }
+  } catch (err) { console.warn('[boot] job rollup refresh failed:', err.message); }
+}
+
 async function main() {
+  loadEnvCache({ onlyMissing: true });
   await env.ready.catch((err) => console.warn('[boot] vault hydration error:', err.message));
 
   // Fail loudly rather than serving half-credentialed. When the vault is the
@@ -152,7 +204,13 @@ async function main() {
   // to start with a silent hole — an operator restart once ControlTower recovers
   // hydrates cleanly. lib/vault already retries with backoff before we get here.
   if (vaultIsCredentialSource() && (!env.SP_API_LWA_CLIENT_ID || !env.SP_API_LWA_CLIENT_SECRET)) {
-    console.error('[boot] fatal: SP-API base LWA credentials (SP_API_LWA_CLIENT_ID/SECRET) were not hydrated from the ControlTower vault after boot retries — refusing to start half-credentialed. Verify ControlTower is reachable and restart.');
+    const fromCache = loadEnvCache({ onlyMissing: false });
+    if (fromCache.applied) {
+      console.warn(`[boot] loaded ${fromCache.applied} SP-API credential(s) from disk cache after vault hydration failed`);
+    }
+  }
+  if (vaultIsCredentialSource() && (!env.SP_API_LWA_CLIENT_ID || !env.SP_API_LWA_CLIENT_SECRET)) {
+    console.error('[boot] fatal: SP-API base LWA credentials (SP_API_LWA_CLIENT_ID/SECRET) were not hydrated from the ControlTower vault. If the vault log shows a 429 rate limit, wait ~15 minutes without restarting (repeated restarts extend the lockout), then run `npm run restart` once. Otherwise verify ControlTower is reachable, or copy the LWA client id/secret into data/.env as a fallback.');
     try {
       audit.record({ event: 'service_boot_aborted', actor: 'system', details: { reason: 'sp_api_base_credentials_unhydrated', version: env.VERSION } });
     } catch (_) { /* audit best-effort */ }
@@ -166,33 +224,15 @@ async function main() {
   writePortFile(port);
   console.log(`[boot] amazon-push-service v${env.VERSION} listening on ${port} (writes ${env.SPAPI_WRITES_ENABLED ? 'ENABLED' : 'disabled'})`);
 
-  // Boot-time recovery: resume interrupted forwards, continue incomplete fan-outs,
-  // close only legacy stuck jobs, refresh open rollups, then poll in-flight feeds.
-  try {
-    const resumed = await jobRecovery.resumeInterruptedForwardsAsync();
-    if (resumed.resumed) console.log(`[boot] resumed ${resumed.resumed}/${resumed.scanned} interrupted submission(s)`);
-  } catch (err) { console.warn('[boot] submission resume failed:', err.message); }
-  try {
-    const fanout = await jobFanOutResume.resumeIncompleteFanOuts();
-    if (fanout.resumed) console.log(`[boot] resumed fan-out on ${fanout.resumed} job(s), ${fanout.processedTargets} target(s)`);
-  } catch (err) { console.warn('[boot] fan-out resume failed:', err.message); }
-  try {
-    const recovered = await jobs.recoverStuckJobsAsync({ staleAfterMinutes: env.JOB_STALE_MINUTES });
-    if (recovered.recovered) console.log(`[boot] closed ${recovered.recovered}/${recovered.scanned} legacy incomplete job(s)`);
-    if (recovered.leftOpen) console.log(`[boot] left ${recovered.leftOpen} resumable job(s) open`);
-    if (recovered.recomputed) console.log(`[boot] recomputed ${recovered.recomputed} open job(s)`);
-  } catch (err) { console.warn('[boot] job recovery failed:', err.message); }
-  try {
-    const { recomputed } = await jobRecovery.recomputeOpenJobsAsync();
-    if (recomputed) console.log(`[boot] refreshed ${recomputed} open job rollup(s)`);
-  } catch (err) { console.warn('[boot] job rollup refresh failed:', err.message); }
-
   audit.record({ event: 'service_boot', actor: 'system', details: { version: env.VERSION, port, writesEnabled: env.SPAPI_WRITES_ENABLED } });
 
-  // Async feed-status poller + over-time reconciliation poller.
+  // Start schedulers before recovery — replaying a large interrupted backlog must
+  // not block feed polling or reconciliation for the rest of the process lifetime.
   poller.start(env.POLLER_CRON);
   reconciler.start(env.RECON_CRON);
   poller.runOnce().catch((err) => console.warn('[boot] initial feed poll failed:', err.message));
+
+  void runBootRecovery();
 
   const shutdown = (signal) => {
     console.log(`[shutdown] ${signal} — closing`);

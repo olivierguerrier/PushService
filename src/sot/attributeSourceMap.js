@@ -307,13 +307,12 @@ const RULES = [
       },
       ['package_dimensions', 'item_package_dimensions'])
   },
+  // PIM has only the single consumer-package weight. Per product decision,
+  // item_weight reuses that single-package measurement (same source as
+  // item_package_weight), which also keeps item_weight <= item_package_weight
+  // (error 90147) satisfied since the two are equal.
   {
-    names: ['item_weight'],
-    kind: 'weight',
-    resolve: weightResolve('item', ['item_weight', 'product_weight', 'net_weight'])
-  },
-  {
-    names: ['item_package_weight'],
+    names: ['item_weight', 'item_package_weight'],
     kind: 'weight',
     resolve: weightResolve('package', ['package_weight', 'pim_package_weight', 'item_package_weight', 'consumer_package_weight', 'shipping_weight', 'pkg_weight'])
   },

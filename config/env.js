@@ -103,7 +103,7 @@ function assertJwtSecret() {
 assertJwtSecret();
 
 module.exports = {
-  ready: vaultBootstrap.ready,
+  get ready() { return vaultBootstrap.ready; },
 
   // HTTP
   get PORT() { return int('PORT', 7791); },

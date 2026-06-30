@@ -17,6 +17,8 @@ const MARKETPLACES = [
   { code: 'FR', label: 'France',               amazonMarketplaceId: 'A13V1IB3VIYZZH', currency: 'EUR', region: 'EU', units: 'metric',   storeDomain: 'amazon.fr' },
   { code: 'IT', label: 'Italy',                amazonMarketplaceId: 'APJ6JRA9NG5V4',  currency: 'EUR', region: 'EU', units: 'metric',   storeDomain: 'amazon.it' },
   { code: 'ES', label: 'Spain',                amazonMarketplaceId: 'A1RKKUPIHCS9HS', currency: 'EUR', region: 'EU', units: 'metric',   storeDomain: 'amazon.es' },
+  { code: 'NL', label: 'Netherlands',          amazonMarketplaceId: 'A1805IZSGTT6HS', currency: 'EUR', region: 'EU', units: 'metric',   storeDomain: 'amazon.nl' },
+  { code: 'PL', label: 'Poland',               amazonMarketplaceId: 'A1C3SOZRARQ6R3', currency: 'PLN', region: 'EU', units: 'metric',   storeDomain: 'amazon.pl' },
   { code: 'AE', label: 'United Arab Emirates', amazonMarketplaceId: 'A2VIGQ35RCS4UG', currency: 'AED', region: 'EU', units: 'metric',   storeDomain: 'amazon.ae' },
   { code: 'SA', label: 'Saudi Arabia',         amazonMarketplaceId: 'A17E79C6D8DWNP', currency: 'SAR', region: 'EU', units: 'metric',   storeDomain: 'amazon.sa' },
   { code: 'AU', label: 'Australia',            amazonMarketplaceId: 'A39IBJ37TRP1C6', currency: 'AUD', region: 'FE', units: 'metric',   storeDomain: 'amazon.com.au' },

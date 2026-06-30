@@ -10,7 +10,7 @@ function sampleSources() {
       identity: { brand: 'B. toys', manufacturer: null, item_number: 'BX1749Z', upc: null },
       pricing: { list_price: 9.99, cost_price: null, currency: 'GBP' },
       dimensions: { item: { length: 5, width: 3, height: 2 }, package: { length: 8, width: 4, height: 3 } },
-      weights: { item: { value: 0.4 }, package: { value: null } },
+      weights: { item: { value: 0.4 }, package: { value: 0.6 } },
       compliance: { country_of_origin: 'CN' },
       content: {}
     },
@@ -37,9 +37,11 @@ test('buildGroundedPackage grounds only attributes with a real source value', ()
   assert.equal(byPath['/attributes/brand'][0].marketplace_id, 'A1F83G8C2ARO7P');
   assert.equal(byPath['/attributes/material'][0].value, 'Wood');
   assert.equal(byPath['/attributes/country_of_origin'][0].value, 'CN');
-  // GB is a metric marketplace: 0.4 lb -> kg, 8 in -> cm.
-  assert.equal(byPath['/attributes/item_weight'][0].value, 0.181);
+  // GB is a metric marketplace. item_weight mirrors the single package weight
+  // (0.6 lb -> 0.272 kg), NOT the item-only 0.4 lb, since PIM has one weight.
+  assert.equal(byPath['/attributes/item_weight'][0].value, 0.272);
   assert.equal(byPath['/attributes/item_weight'][0].unit, 'kilograms');
+  assert.equal(out.valueSources.item_weight, 'snapshot.weights.package');
   assert.equal(byPath['/attributes/list_price'][0].value, 9.99);
   assert.equal(byPath['/attributes/list_price'][0].currency, 'GBP');
   assert.equal(byPath['/attributes/cost_price'][0].value, 4.2, 'cost_price falls back to pricing.sell_price');
@@ -167,19 +169,48 @@ test('parses a single "L x W x H" package dimension string into three axes', () 
 test('dimensions and weight follow the marketplace unit system (imperial vs metric)', () => {
   const sources = { snapshot: null, pim: { package_length: 10, package_width: 5, package_height: 2, package_weight: 3 }, product: null, pricing: null };
 
-  const us = asm.buildGroundedPackage({ attrNames: ['item_package_dimensions', 'item_package_weight'], operation: 'patchItem', sources, marketplaceCode: 'US' });
+  const us = asm.buildGroundedPackage({ attrNames: ['item_package_dimensions', 'item_weight', 'item_package_weight'], operation: 'patchItem', sources, marketplaceCode: 'US' });
   const usByPath = Object.fromEntries(us.package.patches.map((p) => [p.path, p.value]));
   assert.equal(usByPath['/attributes/item_package_dimensions'][0].length.value, 10);
   assert.equal(usByPath['/attributes/item_package_dimensions'][0].length.unit, 'inches');
   assert.equal(usByPath['/attributes/item_package_weight'][0].value, 3);
   assert.equal(usByPath['/attributes/item_package_weight'][0].unit, 'pounds');
+  // item_weight mirrors the single package weight (same value and unit).
+  assert.equal(usByPath['/attributes/item_weight'][0].value, 3);
+  assert.equal(usByPath['/attributes/item_weight'][0].unit, 'pounds');
+  assert.equal(usByPath['/attributes/item_weight'][0].value, usByPath['/attributes/item_package_weight'][0].value);
 
-  const de = asm.buildGroundedPackage({ attrNames: ['item_package_dimensions', 'item_package_weight'], operation: 'patchItem', sources, marketplaceCode: 'DE' });
+  const de = asm.buildGroundedPackage({ attrNames: ['item_package_dimensions', 'item_weight', 'item_package_weight'], operation: 'patchItem', sources, marketplaceCode: 'DE' });
   const deByPath = Object.fromEntries(de.package.patches.map((p) => [p.path, p.value]));
   assert.equal(deByPath['/attributes/item_package_dimensions'][0].length.value, 25.4);
   assert.equal(deByPath['/attributes/item_package_dimensions'][0].length.unit, 'centimeters');
   assert.equal(deByPath['/attributes/item_package_weight'][0].value, 1.361, '3 lb -> kg');
   assert.equal(deByPath['/attributes/item_package_weight'][0].unit, 'kilograms');
+  assert.equal(deByPath['/attributes/item_weight'][0].value, 1.361, '3 lb -> kg');
+  assert.equal(deByPath['/attributes/item_weight'][0].unit, 'kilograms');
+  assert.equal(deByPath['/attributes/item_weight'][0].value, deByPath['/attributes/item_package_weight'][0].value);
+});
+
+test('item_weight is grounded from the PIM package weight, not a sibling value', () => {
+  const sources = {
+    snapshot: null,
+    pim: { package_weight: 4.92 },
+    product: null,
+    pricing: null,
+    siblings: {
+      candidates: {
+        item_weight: [{ value: 6.98, unit: 'pounds', marketplace_id: 'ATVPDKIKX0DER' }]
+      },
+      provenance: { item_weight: 'sibling:some-uuid vendor W68TD (US)' }
+    }
+  };
+  const out = asm.buildGroundedPackage({ attrNames: ['item_weight', 'item_package_weight'], operation: 'patchItem', sources, marketplaceCode: 'US' });
+  const byPath = Object.fromEntries(out.package.patches.map((p) => [p.path, p.value]));
+  // PIM grounding wins over the sibling candidate, and both weights match.
+  assert.equal(byPath['/attributes/item_weight'][0].value, 4.92);
+  assert.equal(byPath['/attributes/item_package_weight'][0].value, 4.92);
+  assert.equal(out.valueSources.item_weight, 'pim.package_weight');
+  assert.equal(out.valueSources.item_package_weight, 'pim.package_weight');
 });
 
 test('collectTargetAttrNames unions Amazon issue attrs, model changed names, and proposed patch paths', () => {
